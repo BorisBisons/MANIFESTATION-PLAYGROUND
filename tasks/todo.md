@@ -19,12 +19,13 @@
 - [x] README with sleep limitation + `pmset repeat wake` suggestion + Automation-permission note
 - [x] Commit + push to `claude/manifestation-notifier-agent-sdfsbs`
 
-## Verification still owed on the Mac (can't run in this Linux container)
-- [ ] `manifest install`, then `manifest send-now` → check new `sends` row + `manifest stats`
-- [ ] `launchctl kickstart -k gui/$(id -u)/com.manifest.agent` → message arrives via launchd path (grant Automation permission if prompted; the binary to allow is `/usr/bin/osascript` or the Python in the plist — see README)
-- [ ] `manifest edit <id> "new text"` + kickstart again → new text arrives
-- [ ] `manifest times 09:00 14:00` → plist regenerated, `launchctl list | grep manifest`
-- [ ] Reboot, log in, next slot still fires
+## Verification on the Mac — CONFIRMED 2026-09-01
+- [x] `manifest install`, then `manifest send-now` → new `sends` row logged, `manifest stats` = 1, message arrived
+- [x] `launchctl kickstart -k gui/$(id -u)/com.manifest.agent` → message arrived via the launchd path (stats 1 → 2, failures 0; slot dedupe then correctly skipped the scheduled 12:33 fire)
+- [x] `manifest edit` applied with no reload (message 1 text updated, next send used it)
+- [x] `manifest times` regenerated the plist and reloaded launchd; `launchctl list` shows com.manifest.agent and com.manifest.shuffle, both status 0
+- [x] `manifest random 18` picked today's random times and installed the nightly shuffler; scheduled sends confirmed arriving
+- [ ] Reboot + login persistence (nothing left to configure — launchd user agents reload at login by design; user can confirm passively)
 
 ## Follow-up: daily random times (user request)
 - [x] `manifest random N` — N random times/day in 08:00–21:30, ≥40 min apart (min-gap sampling, always valid); a second launchd agent `com.manifest.shuffle` reshuffles at 00:10 nightly and reloads the send agent (separate label so it never kills itself mid-reload); `random off` removes it; `uninstall` cleans up both agents; `times` warns when the shuffler will override it. 3 new tests, 18 total, all pass. Caveat: if the Mac sleeps through 00:10, yesterday's times persist until the next shuffle.
