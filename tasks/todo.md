@@ -26,6 +26,9 @@
 - [ ] `manifest times 09:00 14:00` → plist regenerated, `launchctl list | grep manifest`
 - [ ] Reboot, log in, next slot still fires
 
+## Follow-up: daily random times (user request)
+- [x] `manifest random N` — N random times/day in 08:00–21:30, ≥40 min apart (min-gap sampling, always valid); a second launchd agent `com.manifest.shuffle` reshuffles at 00:10 nightly and reloads the send agent (separate label so it never kills itself mid-reload); `random off` removes it; `uninstall` cleans up both agents; `times` warns when the shuffler will override it. 3 new tests, 18 total, all pass. Caveat: if the Mac sleeps through 00:10, yesterday's times persist until the next shuffle.
+
 ## Review
 - Shipped as one file (`manifest.py`, ~430 lines) + tests + README. No dependencies, stdlib only.
 - 15 unit tests pass (rotation fairness, no-repeat, single-message repeat, none-active skip, on-time send, per-slot dedupe, 20-min late skip, midnight slot wraparound, failed-send logging, no-recipient safety, times validation, plist generation, stats, ntfy channel).

@@ -190,6 +190,41 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("today:       2", out)
         self.assertIn("failures:    0", out)
 
+    # ---- random daily times
+
+    def test_random_times_respect_window_gap_and_count(self):
+        import random as _random
+        for seed in range(20):
+            rng = _random.Random(seed)
+            times = manifest.random_times(18, rng)
+            self.assertEqual(len(times), 18)
+            mins = [int(t[:2]) * 60 + int(t[3:]) for t in times]
+            self.assertEqual(mins, sorted(mins))
+            self.assertGreaterEqual(mins[0], manifest.WINDOW_START)
+            self.assertLessEqual(mins[-1], manifest.WINDOW_END)
+            self.assertGreaterEqual(min(b - a for a, b in zip(mins, mins[1:])),
+                                    manifest.MIN_GAP)
+
+    def test_random_command_sets_and_clears_shuffle(self):
+        out = run_cli("random", "5")
+        self.assertIn("today's random times", out)
+        con = manifest.connect()
+        self.assertEqual(manifest.get_setting(con, "shuffle_count"), "5")
+        self.assertEqual(len(manifest.send_times(con)), 5)
+        out = run_cli("random", "off")
+        self.assertIn("random times off", out)
+        self.assertEqual(manifest.get_setting(con, "shuffle_count"), "")
+        # shuffle now does nothing
+        self.assertIn("off", run_cli("shuffle"))
+
+    def test_random_command_validates_count(self):
+        with self.assertRaises(SystemExit):
+            run_cli("random", "0")
+        with self.assertRaises(SystemExit):
+            run_cli("random", "99")
+        with self.assertRaises(SystemExit):
+            run_cli("random", "lots")
+
     def test_channel_ntfy_requires_topic_then_delivers(self):
         run_cli("add", "hello")
         with self.assertRaises(SystemExit):

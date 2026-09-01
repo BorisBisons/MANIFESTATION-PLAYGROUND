@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import os
 import plistlib
+import random
 import sqlite3
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import urllib.request
 from pathlib import Path
 
 LABEL = "com.manifest.agent"
+SHUFFLE_LABEL = "com.manifest.shuffle"
 DEFAULT_TIMES = "08:00,13:00,21:00"
 LATE_LIMIT = dt.timedelta(minutes=20)
 SCRIPT = Path(__file__).resolve()
@@ -28,8 +30,8 @@ def home_dir() -> Path:
     return Path(os.environ.get("MANIFEST_HOME", "~/manifest")).expanduser()
 
 
-def plist_path() -> Path:
-    return Path("~/Library/LaunchAgents").expanduser() / (LABEL + ".plist")
+def plist_path(label=LABEL) -> Path:
+    return Path("~/Library/LaunchAgents").expanduser() / (label + ".plist")
 
 
 def now() -> dt.datetime:
@@ -309,6 +311,79 @@ def reload_agent(con):
     print("launchd agent %s loaded with times: %s" % (LABEL, ", ".join(send_times(con))))
 
 
+# ---------------------------------------------------------------- random times
+
+WINDOW_START = 8 * 60        # 08:00
+WINDOW_END = 21 * 60 + 30    # 21:30
+MIN_GAP = 40                 # keeps every slot clear of its neighbours' 20-min windows
+
+
+def random_times(count, rng=random):
+    """`count` random times in the send window, each at least MIN_GAP apart:
+    sorted uniform picks in the gap-reduced span, then the gaps re-inserted."""
+    slack = (WINDOW_END - WINDOW_START) - (count - 1) * MIN_GAP
+    offsets = sorted(rng.uniform(0, slack) for _ in range(count))
+    return ["%02d:%02d" % divmod(WINDOW_START + int(o) + i * MIN_GAP, 60)
+            for i, o in enumerate(offsets)]
+
+
+def cmd_shuffle(args):
+    """Daily launchd entry point (separate agent, runs after midnight):
+    pick fresh random times for today and reload the send agent."""
+    con = connect()
+    count = get_setting(con, "shuffle_count")
+    if not count:
+        print("random times are off (manifest random <count>)")
+        return
+    times = random_times(int(count))
+    set_setting(con, "send_times", ",".join(times))
+    print("today's random times: %s" % ", ".join(times))
+    reload_agent(con)
+
+
+def cmd_random(args):
+    con = connect()
+    uid = os.getuid()
+    if args.count.lower() == "off":
+        set_setting(con, "shuffle_count", "")
+        if sys.platform == "darwin":
+            subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, SHUFFLE_LABEL)],
+                           capture_output=True)
+            if plist_path(SHUFFLE_LABEL).exists():
+                plist_path(SHUFFLE_LABEL).unlink()
+        print("random times off; keeping current schedule: %s" % ", ".join(send_times(con)))
+        return
+    try:
+        count = int(args.count)
+    except ValueError:
+        sys.exit("usage: manifest random <count>  (or: manifest random off)")
+    max_count = (WINDOW_END - WINDOW_START) // MIN_GAP + 1
+    if not 1 <= count <= max_count:
+        sys.exit("count must be 1-%d (times fit 08:00-21:30, %d min apart)" % (max_count, MIN_GAP))
+    set_setting(con, "shuffle_count", str(count))
+    if sys.platform == "darwin":
+        shuffle_plist = {
+            "Label": SHUFFLE_LABEL,
+            "ProgramArguments": [sys.executable, str(SCRIPT), "shuffle"],
+            "StartCalendarInterval": [{"Hour": 0, "Minute": 10}],
+            "StandardOutPath": str(home_dir() / "launchd.log"),
+            "StandardErrorPath": str(home_dir() / "launchd.log"),
+        }
+        plist_path(SHUFFLE_LABEL).parent.mkdir(parents=True, exist_ok=True)
+        with open(plist_path(SHUFFLE_LABEL), "wb") as f:
+            plistlib.dump(shuffle_plist, f)
+        subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, SHUFFLE_LABEL)],
+                       capture_output=True)
+        proc = subprocess.run(
+            ["launchctl", "bootstrap", "gui/%d" % uid, str(plist_path(SHUFFLE_LABEL))],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            sys.exit("launchctl bootstrap failed: %s" % (proc.stderr or proc.stdout).strip())
+        print("daily shuffler loaded: %d fresh random times every night at 00:10" % count)
+    cmd_shuffle(args)
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_add(args):
@@ -381,6 +456,9 @@ def cmd_times(args):
         sys.exit("times must look like HH:MM, e.g.: manifest times 08:00 13:00 21:00")
     set_setting(con, "send_times", ",".join(parsed))
     print("send times: %s" % ", ".join(parsed))
+    if get_setting(con, "shuffle_count"):
+        print("NOTE: random times are on, so tonight's shuffle will replace these"
+              " (turn off with: manifest random off)")
     reload_agent(con)
 
 
@@ -453,11 +531,12 @@ def cmd_install(args):
 
 def cmd_uninstall(args):
     if sys.platform == "darwin":
-        subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)],
-                       capture_output=True)
-        if plist_path().exists():
-            plist_path().unlink()
-            print("launchd agent removed")
+        for label in (LABEL, SHUFFLE_LABEL):
+            subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), label)],
+                           capture_output=True)
+            if plist_path(label).exists():
+                plist_path(label).unlink()
+                print("launchd agent %s removed" % label)
     wrapper = Path("~/.local/bin/manifest").expanduser()
     if wrapper.exists():
         wrapper.unlink()
@@ -483,7 +562,10 @@ def main(argv=None):
     s = sub.add_parser("stats", help="send counts and failures"); s.set_defaults(f=cmd_stats)
     s = sub.add_parser("channel", help="switch delivery channel")
     s.add_argument("channel", choices=["imessage", "ntfy"]); s.add_argument("--topic"); s.set_defaults(f=cmd_channel)
+    s = sub.add_parser("random", help="N fresh random send times every day (or: off)")
+    s.add_argument("count", metavar="N|off"); s.set_defaults(f=cmd_random)
     s = sub.add_parser("run", help="(launchd) send for the current slot"); s.set_defaults(f=cmd_run)
+    s = sub.add_parser("shuffle", help="(launchd) re-randomize today's times"); s.set_defaults(f=cmd_shuffle)
     s = sub.add_parser("install", help="set up command, DB and launchd agent")
     s.add_argument("--recipient"); s.set_defaults(f=cmd_install)
     s = sub.add_parser("uninstall", help="remove launchd agent and command (keeps DB)"); s.set_defaults(f=cmd_uninstall)
