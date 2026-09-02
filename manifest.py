@@ -27,8 +27,10 @@ SHUFFLE_LABEL = "com.manifest.shuffle"
 DEFAULT_TIMES = "08:00,13:00,21:00"
 LATE_LIMIT = dt.timedelta(minutes=20)
 CATCHUP_PAUSE = 3  # seconds between catch-up sends so they arrive one by one
-RETRY_PAUSES = (5, 10, 15, 30, 60)  # seconds before each retry: Wi-Fi and iMessage need a moment after wake
-RELAUNCH_INTERVAL = 300  # launchd relaunches `run` this often while a delivery is still failing
+RETRY_PAUSES = (5, 10, 15, 30, 60, 120)  # seconds before each retry: Wi-Fi and iMessage need a moment after wake
+# launchd spawns the agent at most this often (calendar firings included), so
+# keep it short and let the in-run ladder above set the failure cadence
+RELAUNCH_INTERVAL = 60
 OWED_FOR = dt.timedelta(days=3)  # how far back a missed or failed occurrence stays due
 SCRIPT = Path(__file__).resolve()
 OSASCRIPT = "/usr/bin/osascript"
@@ -88,17 +90,23 @@ def connect() -> sqlite3.Connection:
     con.executescript(SCHEMA)
     # DBs from before sends were keyed by slot occurrence lack slot_at
     if "slot_at" not in [r["name"] for r in con.execute("PRAGMA table_info(sends)")]:
-        con.execute("ALTER TABLE sends ADD COLUMN slot_at TEXT")
-        con.commit()
+        try:
+            con.execute("ALTER TABLE sends ADD COLUMN slot_at TEXT")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass  # a concurrent first contact migrated a moment ago
         if get_setting(con, "send_times") and not get_setting(con, "schedule_since"):
-            # Upgrading from before the schedule floor existed: the current
-            # times took effect when their plist was written, so floor there
-            # (slots the old code slept through since then are still owed);
-            # without a plist, just far enough back that a firing this minute
-            # still counts.
+            # Upgrading from before the schedule floor existed. The old code
+            # sent or deliberately skipped everything up to its last record,
+            # so the new contract owns only what came after that — and never
+            # before the current times took effect (their plist's write
+            # time). A firing in the current minute still counts.
             since = now() - LATE_LIMIT
             if plist_path().exists():
                 since = dt.datetime.fromtimestamp(plist_path().stat().st_mtime)
+            last = con.execute("SELECT MAX(sent_at) AS t FROM sends").fetchone()["t"]
+            if last:
+                since = max(since, min(dt.datetime.fromisoformat(last), now() - LATE_LIMIT))
             set_setting(con, "schedule_since", ts(since))
     return con
 
@@ -251,11 +259,23 @@ def imessage_connected():
     return None if status not in ("connecting", "disconnected", "disconnecting", "offline") else False
 
 
-def send_imessage(recipient, text):
+PERMANENT_MARKERS = ("-1743", "not allowed", "not authorized", "can't get account",
+                     "no recipient configured", "no ntfy_topic configured")
+
+
+def permanent(err):
+    """An error waiting cannot fix — permission, account or configuration —
+    so retrying is pointless until the owner acts."""
+    e = (err or "").lower()
+    return any(m in e for m in PERMANENT_MARKERS)
+
+
+def send_imessage(recipient, text, before_send=None):
     """Returns (ok, error): ok is True, False, or None when the outcome is
     unknown (osascript timed out — Messages may still deliver the queued
-    event, so the caller must not resend). If the first try fails (e.g.
-    Messages.app not running), launches Messages and retries once."""
+    event, so the caller must not resend). `before_send` is called right
+    before the one call whose outcome can be unknown. If the first try fails
+    (e.g. Messages.app not running), launches Messages and retries once."""
     try:
         # after a cold boot Messages can take a while to start; do not spend
         # the probe's and the send's timeouts on that
@@ -267,6 +287,8 @@ def send_imessage(recipient, text):
         return False, "iMessage account is not connected yet"
     proc = None
     for attempt in (1, 2):
+        if before_send:
+            before_send()
         try:
             proc = subprocess.run(
                 [OSASCRIPT, "-e", APPLESCRIPT_SEND, text, recipient],
@@ -297,7 +319,7 @@ def send_imessage(recipient, text):
     return False, err
 
 
-def send_ntfy(topic, text):
+def send_ntfy(topic, text, before_send=None):
     """Returns (ok, error); ok is None when the response timed out after the
     request went out (the push may have been delivered, so never resend).
     A connect-phase failure, timeouts included, arrives wrapped in URLError
@@ -306,6 +328,8 @@ def send_ntfy(topic, text):
         req = urllib.request.Request(
             "https://ntfy.sh/" + topic, data=text.encode("utf-8"), method="POST"
         )
+        if before_send:
+            before_send()
         with urllib.request.urlopen(req, timeout=15):
             pass
         return True, None
@@ -317,7 +341,7 @@ def send_ntfy(topic, text):
         return False, str(exc)
 
 
-def deliver(con, text):
+def deliver(con, text, before_send=None):
     """Send text over the configured channel. Returns (channel, ok, error).
     The recipient/topic comes only from settings — never from anywhere else."""
     channel = get_setting(con, "channel", "imessage")
@@ -325,12 +349,12 @@ def deliver(con, text):
         topic = get_setting(con, "ntfy_topic")
         if not topic:
             return channel, False, "no ntfy_topic configured (manifest channel ntfy --topic X)"
-        ok, err = send_ntfy(topic, text)
+        ok, err = send_ntfy(topic, text, before_send)
     else:
         recipient = get_setting(con, "recipient")
         if not recipient:
             return channel, False, "no recipient configured (run: manifest install)"
-        ok, err = send_imessage(recipient, text)
+        ok, err = send_imessage(recipient, text, before_send)
     return channel, ok, err
 
 
@@ -372,20 +396,23 @@ def do_send(con, slot, slot_dt=None, catching_up=False):
         print("skipped: no active messages (add one: manifest add \"...\")")
         return True
     pace(con)
-    # Claim the occurrence before delivering: if this process dies mid-send
-    # the row stays 'unknown' and the occurrence is never sent twice.
-    row_id = log_send(con, msg["id"], slot, "-", "unknown",
-                      "interrupted before the outcome was recorded", slot_at)
+    # Claim the occurrence first. Until the actual send call nothing has
+    # gone out, so the claim is 'failed' (a kill there means: retry); it
+    # flips to 'unknown' right before the send, so a kill during it can
+    # never cause a second text.
+    row_id = log_send(con, msg["id"], slot, "-", "failed",
+                      "interrupted before the send started", slot_at)
+
+    def before_send():
+        finish_send(con, row_id, "-", "unknown", "interrupted before the outcome was recorded")
+
     for attempt, pause in enumerate((0,) + tuple(RETRY_PAUSES), 1):
         if pause:
-            # between attempts the outcome is definite: a kill during the
-            # pause must leave the occurrence retried, not retired
             finish_send(con, row_id, channel, "failed", err)
             print("attempt %d failed (%s); retrying in %ds" % (attempt - 1, err, pause))
             time.sleep(pause)
-            finish_send(con, row_id, "-", "unknown", "interrupted before the outcome was recorded")
-        channel, ok, err = deliver(con, msg["text"])
-        if ok is not False:
+        channel, ok, err = deliver(con, msg["text"], before_send)
+        if ok is not False or permanent(err):
             break
     status = "ok" if ok else "failed" if ok is False else "unknown"
     finish_send(con, row_id, channel, status, err)
@@ -406,8 +433,7 @@ def do_send(con, slot, slot_dt=None, catching_up=False):
 
 def failed_due(con, at):
     """Occurrences whose delivery failed and are still unhandled — what keeps
-    `run` exiting non-zero so launchd relaunches it. A failure stays owed for
-    OWED_FOR (longer than the 24 h catch-up lookback: we tried, so it counts)."""
+    `run` exiting non-zero so launchd relaunches it. Owed for OWED_FOR."""
     rows = con.execute(
         "SELECT DISTINCT slot, slot_at FROM sends WHERE status = 'failed'"
         " AND slot_at IS NOT NULL AND slot_at > ?", (ts(at - OWED_FOR),))
@@ -424,28 +450,30 @@ def at_time(hh_mm, day):
 
 
 def resolve_slot(times, at):
-    """Nearest configured slot occurrence to `at` (checks yesterday, today and
-    tomorrow so midnight-adjacent slots resolve correctly).
-    Returns (slot_str, slot_datetime)."""
-    best = None
-    for t in times:
-        for day in (-1, 0, 1):
-            slot_dt = at_time(t, at + dt.timedelta(days=day))
-            diff = abs(at - slot_dt)
-            if best is None or diff < best[2]:
-                best = (t, slot_dt, diff)
-    return best[0], best[1]
+    """The slot occurrence this firing is for: the most recent one if it is
+    within LATE_LIMIT (a replayed firing must not be mistaken for a nearer
+    upcoming slot), else the nearest (checks yesterday, today and tomorrow
+    so midnight-adjacent slots resolve correctly). Returns (slot, datetime)."""
+    cands = [(t, at_time(t, at + dt.timedelta(days=day))) for t in times for day in (-1, 0, 1)]
+    past = [c for c in cands if c[1] <= at]
+    if past:
+        t, slot_dt = max(past, key=lambda c: c[1])
+        if at - slot_dt <= LATE_LIMIT:
+            return t, slot_dt
+    return min(cands, key=lambda c: abs(at - c[1]))
 
 
 def already_handled(con, slot, slot_dt):
     """True if this exact slot occurrence was sent or deliberately skipped
     (a failed attempt does not count, so it is retried). Rows from before
-    slot_at existed are matched by slot time within 30 minutes."""
+    slot_at existed are matched by slot name over the old code's horizon:
+    from 30 min early to just under a day late (its catch-ups were logged
+    at the wake time, hours after the slot)."""
     return con.execute(
         "SELECT 1 FROM sends WHERE (slot_at = ? AND status != 'failed')"
-        " OR (slot_at IS NULL AND status = 'ok' AND slot = ? AND sent_at BETWEEN ? AND ?)",
+        " OR (slot_at IS NULL AND status = 'ok' AND slot = ? AND sent_at >= ? AND sent_at < ?)",
         (ts(slot_dt), slot, ts(slot_dt - dt.timedelta(minutes=30)),
-         ts(slot_dt + dt.timedelta(minutes=30))),
+         ts(slot_dt + dt.timedelta(hours=24))),
     ).fetchone() is not None
 
 
@@ -488,6 +516,9 @@ def catch_up_missed(con, times, at, late=LATE_LIMIT):
         print("catching up missed slot %s (%s)" % (t, slot_dt))
         if not do_send(con, t, slot_dt, catching_up=True):
             for t2, slot_dt2 in missed[i + 1:]:
+                if con.execute("SELECT 1 FROM sends WHERE slot_at = ? AND status = 'failed'",
+                               (ts(slot_dt2),)).fetchone():
+                    continue  # already on record as owed
                 log_send(con, None, t2, "-", "failed",
                          "deferred: an earlier catch-up failed", ts(slot_dt2))
             print("catch-up paused; %d slot(s) stay due for the next run" % (len(missed) - i - 1))
@@ -503,7 +534,11 @@ def set_schedule(con, times, at=None):
     at = at or now()
     catch_up_missed(con, send_times(con), at, late=dt.timedelta(0))
     set_setting(con, "send_times", ",".join(times), commit=False)
-    set_setting(con, "schedule_since", ts(at))
+    # floor just before this minute: a new slot equal to the current minute
+    # (a reshuffle at wake, or `times HH:MM` typed during HH:MM) is one
+    # launchd will never fire, so the reload's run must send it
+    floor = at.replace(second=0, microsecond=0) - dt.timedelta(seconds=1)
+    set_setting(con, "schedule_since", ts(floor))
 
 
 def cmd_run(args):
@@ -517,20 +552,28 @@ def cmd_run(args):
     print("[%s] run (power: %s)" % (ts(at), power_source()))
     try:
         run_slots(con, at)
-        # a run can span a sleep or a long retry ladder: whatever fired
-        # meanwhile is handled on a fresh clock
-        if now() - at > WAKE_LEAD:
-            run_slots(con, now())
+        # A run can span a sleep or a long retry ladder: a slot that fired
+        # meanwhile is handled on a fresh clock (not after a failure — the
+        # relaunch below covers it without running the ladder twice).
+        fresh = now()
+        fired_meanwhile = at < resolve_slot(send_times(con), fresh)[1] <= fresh
+        if not failed_due(con, fresh) and (fresh - at > LATE_LIMIT or fired_meanwhile):
+            run_slots(con, fresh)
     except Exception as exc:
-        # a bug must not become a 5-minute relaunch loop: report it and let
-        # the next calendar firing try again
+        # a bug must not become a relaunch loop: report it and let the next
+        # calendar firing try again
         traceback.print_exc()
         notify("manifest: run crashed", "%s — see ~/manifest/launchd.log" % exc)
         schedule_wakes(con)
         return
     schedule_wakes(con)
     if failed_due(con, now()):
-        print("delivery still failing; launchd retries in %d s" % RELAUNCH_INTERVAL)
+        last = con.execute("SELECT error FROM sends WHERE status = 'failed'"
+                           " ORDER BY id DESC LIMIT 1").fetchone()
+        if permanent(last["error"]):
+            print("delivery needs your attention (%s); waiting for the next slot" % last["error"])
+            return
+        print("delivery still failing; launchd retries in about %d s" % RELAUNCH_INTERVAL)
         sys.exit(1)
 
 
@@ -991,8 +1034,9 @@ def cmd_install(args):
         # the schedule starts (or restarts after an uninstall) now: nothing earlier is "missed"
         set_setting(con, "schedule_since", ts())
     if get_setting(con, "shuffle_count") and get_setting(con, "shuffled_on") is None:
-        # upgrading with random on: today's times already are today's draw
-        set_setting(con, "shuffled_on", str(now().date()))
+        # upgrading with random on: the current times are the draw made on
+        # the day the schedule took effect (a missed 00:10 then reshuffles)
+        set_setting(con, "shuffled_on", get_setting(con, "schedule_since")[:10])
     if not con.execute("SELECT 1 FROM messages WHERE active = 1 AND deleted_at IS NULL").fetchone():
         print('NOTE: no messages yet — nothing sends until you: manifest add "..."')
 
@@ -1007,6 +1051,10 @@ def cmd_install(args):
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         print('  NOTE: %s is not on your PATH; add: export PATH="%s:$PATH"' % (bin_dir, bin_dir))
 
+    due = missed_slots(con, send_times(con), now())
+    if due:
+        print("%d missed slot(s) will be sent right after install: %s"
+              % (len(due), ", ".join(t for t, _ in due)))
     reload_agent(con)
     if sys.platform == "darwin" and get_setting(con, "shuffle_count"):
         load_agent(SHUFFLE_LABEL, build_shuffle_plist())

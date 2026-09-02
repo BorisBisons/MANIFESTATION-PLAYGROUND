@@ -42,7 +42,9 @@ class ManifestTest(unittest.TestCase):
         self.addCleanup(os.environ.pop, "MANIFEST_HOME", None)
         self.sent = []
 
-        def fake_send(recipient, text):
+        def fake_send(recipient, text, before_send=None):
+            if before_send:
+                before_send()  # as the real sender does right before dispatch
             self.sent.append((recipient, text))
             return True, None
 
@@ -225,7 +227,7 @@ class ManifestTest(unittest.TestCase):
     def test_failed_catch_up_is_retried_on_the_next_run(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 30, 0))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "network down")):
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "network down")):
             self.assertIn("FAILED", run_cli("run", expect_exit=1))
         self.assertEqual(self.sent, [])
         self._freeze(dt.datetime(2026, 9, 1, 8, 45, 0))
@@ -239,7 +241,7 @@ class ManifestTest(unittest.TestCase):
         run_cli("add", "hello")
         calls = []
 
-        def flaky(recipient, text):
+        def flaky(recipient, text, before_send=None):
             calls.append(text)
             return (True, None) if len(calls) == 2 else (False, "Messages not ready")
 
@@ -247,7 +249,7 @@ class ManifestTest(unittest.TestCase):
             out = run_cli("send-now")
         self.assertIn("sent", out)
         self.assertEqual(len(calls), 2)
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "nope")):
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "nope")):
             calls.clear()
             self.assertIn("FAILED", run_cli("send-now"))
 
@@ -255,7 +257,7 @@ class ManifestTest(unittest.TestCase):
         run_cli("add", "hello")
         calls = []
 
-        def hangs(recipient, text):
+        def hangs(recipient, text, before_send=None):
             calls.append(text)
             return None, "osascript timed out"
 
@@ -301,7 +303,7 @@ class ManifestTest(unittest.TestCase):
     def test_catch_up_stops_at_first_failure_and_resumes_later(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")):
             out = run_cli("run", expect_exit=1)
         self.assertIn("catch-up paused; 1 slot(s) stay due", out)
         con = manifest.connect()
@@ -314,7 +316,7 @@ class ManifestTest(unittest.TestCase):
     def test_run_exits_non_zero_only_while_a_delivery_is_failing(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")):
             self.assertIn("launchd retries", run_cli("run", expect_exit=1))  # KeepAlive relaunches it
         self._freeze(dt.datetime(2026, 9, 1, 8, 5, 5))
         run_cli("run")  # relaunch, online: exits 0
@@ -362,7 +364,7 @@ class ManifestTest(unittest.TestCase):
     def test_failure_banner_once_per_occurrence(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")), \
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")), \
                 mock.patch.object(manifest, "notify") as notify:
             run_cli("run", expect_exit=1)
             self._freeze(dt.datetime(2026, 9, 1, 8, 5, 5))
@@ -431,7 +433,7 @@ class ManifestTest(unittest.TestCase):
         self._freeze(dt.datetime(2026, 9, 1, 8, 5, 2))
         run_cli("run")
         self._freeze(dt.datetime(2026, 9, 2, 7, 30, 0))  # slept from 12:00, still offline
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")):
             run_cli("times", "10:00", "16:00", "21:10")  # a replayed reshuffle switches anyway
         self.assertEqual(self._ok_slots(), ["08:05"])
         self.assertIn("missed now:  14:20, 20:50", run_cli("status"))
@@ -459,12 +461,93 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("predates the current schedule", out)
         self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
 
-    def test_slot_at_the_exact_switch_second_is_not_sent(self):
+    def test_new_slot_in_the_switch_minute_is_sent_by_the_reload_run(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 20))
+        run_cli("times", "15:00", "21:00")  # launchd will never fire 15:00 today
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 25))
+        run_cli("run")  # RunAtLoad after the reload
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00", "15:00"])
+        self.assertIn("already sent", run_cli("run"))
+
+    def test_a_failing_run_does_the_ladder_once(self):
+        run_cli("add", "hello")
+        calls = []
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 2))
+
+        def offline(recipient, text, before_send=None):
+            calls.append(text)
+            return False, "iMessage account is not connected yet"
+
+        with mock.patch.object(manifest, "send_imessage", offline), \
+                mock.patch.object(manifest, "RETRY_PAUSES", (0, 0)):
+            run_cli("run", expect_exit=1)
+        self.assertEqual(len(calls), 3)
+
+    def test_permanent_errors_stop_the_ladder_and_do_not_relaunch(self):
+        run_cli("add", "hello")
+        calls = []
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 2))
+
+        def denied(recipient, text, before_send=None):
+            calls.append(text)
+            return False, "execution error: Not authorized to send Apple events (-1743)"
+
+        with mock.patch.object(manifest, "send_imessage", denied), \
+                mock.patch.object(manifest, "notify") as notify:
+            out = run_cli("run", expect_exit=0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("needs your attention", out)
+        self.assertEqual(notify.call_count, 1)
+        self.assertIn("08:00", [t for t, _ in manifest.missed_slots(manifest.connect(), ["08:00"],
+                                                                     dt.datetime(2026, 9, 1, 9, 0))])
+
+    def test_claim_is_failed_until_the_send_itself(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 2))
+        con = manifest.connect()
+
+        def killed_before_send(recipient, text, before_send=None):
+            row = con.execute("SELECT status FROM sends WHERE slot = '08:00'").fetchone()
+            self.assertEqual(row["status"], "failed")  # nothing sent yet
+            before_send()
+            row = con.execute("SELECT status FROM sends WHERE slot = '08:00'").fetchone()
+            self.assertEqual(row["status"], "unknown")  # now it may go out
+            raise KeyboardInterrupt
+
+        with mock.patch.object(manifest, "send_imessage", killed_before_send):
+            with self.assertRaises(KeyboardInterrupt):
+                run_cli("run")
+
+    def test_legacy_late_catch_up_rows_count_as_handled(self):
+        run_cli("add", "hello")
+        con = manifest.connect()
+        con.execute("INSERT INTO sends (message_id, slot, sent_at, channel, status)"
+                    " VALUES (1, '08:00', '2026-09-01T10:02:00', 'imessage', 'ok')")  # old catch-up
+        con.commit()
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        run_cli("run")
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])  # 08:00 not re-sent
+
+    def test_replayed_firing_prefers_the_slot_just_passed(self):
+        self.assertEqual(manifest.resolve_slot(["09:00", "09:10"], dt.datetime(2026, 9, 1, 9, 6)),
+                         ("09:00", dt.datetime(2026, 9, 1, 9, 0)))
+        self.assertEqual(manifest.resolve_slot(["09:00", "09:10"], dt.datetime(2026, 9, 1, 8, 55)),
+                         ("09:00", dt.datetime(2026, 9, 1, 9, 0)))
+        self.assertEqual(manifest.resolve_slot(["09:00"], dt.datetime(2026, 9, 1, 9, 30)),
+                         ("09:00", dt.datetime(2026, 9, 1, 9, 0)))
+
+    def test_deferred_rows_are_written_once_per_occurrence(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
-        run_cli("times", "15:00", "21:00")
-        self.assertIn("predates the current schedule", run_cli("run"))
-        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")):
+            run_cli("run", expect_exit=1)
+            self._freeze(dt.datetime(2026, 9, 1, 15, 1, 0))
+            run_cli("run", expect_exit=1)
+        con = manifest.connect()
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) AS n FROM sends WHERE error LIKE 'deferred:%'").fetchone()["n"], 1)
 
     def test_shuffle_marks_the_day_only_after_the_reload(self):
         self._freeze(dt.datetime(2026, 9, 1, 0, 10, 0))
@@ -482,7 +565,7 @@ class ManifestTest(unittest.TestCase):
     def test_failed_occurrence_stays_owed_for_days(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 30, 0))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")):
             run_cli("run", expect_exit=1)
         self._freeze(dt.datetime(2026, 9, 3, 12, 0, 0))  # closed for two days
         run_cli("run")
@@ -517,6 +600,21 @@ class ManifestTest(unittest.TestCase):
         run_cli("run")
         self.assertEqual(self._ok_slots(), ["13:00"])  # not "predates the schedule"
 
+    def test_upgrade_floor_never_predates_the_old_codes_last_record(self):
+        old = self._old_version_db()
+        raw = sqlite3.connect(Path(old) / "manifest.db")
+        # the old code deliberately skipped the morning; the new code must not resurrect it
+        raw.execute("INSERT INTO sends (message_id, slot, sent_at, channel, status, error)"
+                    " VALUES (NULL, '13:00', '2026-09-01T13:35:00', '-', 'skipped', 'late (no backfill)')")
+        raw.commit()
+        raw.close()
+        os.environ["MANIFEST_HOME"] = old
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        with mock.patch.object(manifest, "plist_path", lambda label=None: Path(self.tmp.name) / "none"):
+            run_cli("add", "hello")
+            self.assertIn("skipped", run_cli("run"))
+        self.assertEqual(self.sent, [])
+
     def test_upgrade_floor_uses_the_plist_write_time_when_present(self):
         os.environ["MANIFEST_HOME"] = self._old_version_db()
         plist = Path(self.tmp.name) / "com.manifest.agent.plist"
@@ -531,7 +629,7 @@ class ManifestTest(unittest.TestCase):
     def test_a_kill_during_a_retry_pause_leaves_the_slot_retried(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")), \
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")), \
                 mock.patch.object(manifest, "RETRY_PAUSES", (1,)), \
                 mock.patch.object(manifest.time, "sleep", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
@@ -546,13 +644,13 @@ class ManifestTest(unittest.TestCase):
     def test_first_real_failure_banners_even_after_a_deferred_row(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")), \
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")), \
                 mock.patch.object(manifest, "notify") as notify:
             run_cli("run", expect_exit=1)  # 08:00 fails, 13:00 deferred
             self.assertEqual(notify.call_count, 1)
             calls = []
 
-            def second_fails(recipient, text):
+            def second_fails(recipient, text, before_send=None):
                 calls.append(text)
                 return (True, None) if len(calls) == 1 else (False, "Messages got an error")
 
@@ -563,7 +661,14 @@ class ManifestTest(unittest.TestCase):
     def test_a_kill_between_delivery_and_logging_does_not_double_send(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
-        with mock.patch.object(manifest, "finish_send", side_effect=KeyboardInterrupt):
+        real_finish = manifest.finish_send
+
+        def dies_after_sending(con, row_id, channel, status, error):
+            if status == "ok":
+                raise KeyboardInterrupt
+            real_finish(con, row_id, channel, status, error)
+
+        with mock.patch.object(manifest, "finish_send", dies_after_sending):
             with self.assertRaises(KeyboardInterrupt):
                 run_cli("run")
         self.assertEqual(len(self.sent), 1)
@@ -656,7 +761,7 @@ class ManifestTest(unittest.TestCase):
     def test_uninstall_retires_still_owed_failures(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 30, 0))
-        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+        with mock.patch.object(manifest, "send_imessage", lambda r, t, before_send=None: (False, "offline")):
             run_cli("run", expect_exit=1)
         run_cli("uninstall")
         con = manifest.connect()
@@ -695,7 +800,7 @@ class ManifestTest(unittest.TestCase):
     def test_failed_send_is_logged(self):
         run_cli("add", "hello")
         with mock.patch.object(manifest, "send_imessage",
-                               lambda r, t: (False, "Messages got an error")):
+                               lambda r, t, before_send=None: (False, "Messages got an error")):
             out = run_cli("send-now")
         self.assertIn("FAILED", out)
         con = manifest.connect()
@@ -825,7 +930,7 @@ class ManifestTest(unittest.TestCase):
         run_cli("channel", "ntfy", "--topic", "my-topic")
         calls = []
         with mock.patch.object(manifest, "send_ntfy",
-                               lambda topic, text: (calls.append((topic, text)) or (True, None))):
+                               lambda topic, text, before_send=None: (calls.append((topic, text)) or (True, None))):
             run_cli("send-now")
         self.assertEqual(calls, [("my-topic", "hello")])
         con = manifest.connect()
