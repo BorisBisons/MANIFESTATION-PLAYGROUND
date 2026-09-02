@@ -489,14 +489,73 @@ class ManifestTest(unittest.TestCase):
             "SELECT slot_at FROM sends WHERE status = 'ok' AND slot = '08:00'").fetchone()["slot_at"],
             "2026-09-01T08:00:00")
 
-    def test_upgrade_starts_the_floor_at_the_first_connect(self):
+    def _old_version_db(self):
+        """A DB as the previous script version left it: no slot_at column, a
+        schedule, no floor. Returns its directory."""
+        old = tempfile.mkdtemp(dir=self.tmp.name)
+        raw = sqlite3.connect(Path(old) / "manifest.db")
+        raw.execute("CREATE TABLE sends (id INTEGER PRIMARY KEY, message_id INTEGER,"
+                    " slot TEXT NOT NULL, sent_at TEXT NOT NULL, channel TEXT NOT NULL,"
+                    " status TEXT NOT NULL, error TEXT)")
+        raw.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        raw.execute("INSERT INTO settings VALUES ('send_times', '08:00,13:00,21:00'),"
+                    " ('recipient', '+15550001111')")
+        raw.commit()
+        raw.close()
+        return old
+
+    def test_upgrade_floors_at_the_schedule_load_and_keeps_the_current_firing(self):
+        os.environ["MANIFEST_HOME"] = self._old_version_db()
+        self._freeze(dt.datetime(2026, 9, 1, 13, 0, 1))  # first launchd firing after git pull
+        with mock.patch.object(manifest, "plist_path", lambda label=None: Path(self.tmp.name) / "none"):
+            run_cli("add", "hello")  # first contact: connect() migrates
         con = manifest.connect()
-        con.execute("DELETE FROM settings WHERE key = 'schedule_since'")
-        manifest.set_setting(con, "send_times", "08:00,13:00")
-        con.close()
+        self.assertEqual(manifest.get_setting(con, "schedule_since"), "2026-09-01T12:40:01")
+        run_cli("run")
+        self.assertEqual(self._ok_slots(), ["13:00"])  # not "predates the schedule"
+
+    def test_upgrade_floor_uses_the_plist_write_time_when_present(self):
+        os.environ["MANIFEST_HOME"] = self._old_version_db()
+        plist = Path(self.tmp.name) / "com.manifest.agent.plist"
+        plist.write_bytes(b"<plist/>")
+        loaded = dt.datetime(2026, 9, 1, 0, 10, 0)
+        os.utime(plist, (loaded.timestamp(), loaded.timestamp()))
         self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        with mock.patch.object(manifest, "plist_path", lambda label=None: plist):
+            con = manifest.connect()
+        self.assertEqual(manifest.get_setting(con, "schedule_since"), "2026-09-01T00:10:00")
+
+    def test_a_kill_during_a_retry_pause_leaves_the_slot_retried(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
+        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")), \
+                mock.patch.object(manifest, "RETRY_PAUSES", (1,)), \
+                mock.patch.object(manifest.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                run_cli("run")
         con = manifest.connect()
-        self.assertEqual(manifest.get_setting(con, "schedule_since"), "2026-09-01T15:00:00")
+        self.assertEqual(con.execute(
+            "SELECT status FROM sends WHERE slot = '08:00'").fetchone()["status"], "failed")
+        run_cli("run")  # relaunch, online: retried once, not twice
+        self.assertEqual(self._ok_slots(), ["08:00"])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_first_real_failure_banners_even_after_a_deferred_row(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")), \
+                mock.patch.object(manifest, "notify") as notify:
+            run_cli("run", expect_exit=1)  # 08:00 fails, 13:00 deferred
+            self.assertEqual(notify.call_count, 1)
+            calls = []
+
+            def second_fails(recipient, text):
+                calls.append(text)
+                return (True, None) if len(calls) == 1 else (False, "Messages got an error")
+
+            with mock.patch.object(manifest, "send_imessage", second_fails):
+                run_cli("run", expect_exit=1)  # 08:00 ok, 13:00 fails for real
+        self.assertEqual(notify.call_count, 2)
 
     def test_a_kill_between_delivery_and_logging_does_not_double_send(self):
         run_cli("add", "hello")
@@ -523,6 +582,10 @@ class ManifestTest(unittest.TestCase):
                                side_effect=manifest.urllib.error.URLError("nodename nor servname")):
             out = run_cli("send-now")
         self.assertIn("FAILED", out)
+        # a connect-phase timeout is wrapped in URLError: definite, retried
+        with mock.patch.object(manifest.urllib.request, "urlopen",
+                               side_effect=manifest.urllib.error.URLError(manifest.socket.timeout())):
+            self.assertIn("FAILED", run_cli("send-now"))
 
     def test_pace_keeps_sends_apart_across_processes(self):
         con = manifest.connect()

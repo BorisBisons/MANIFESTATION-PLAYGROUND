@@ -90,10 +90,16 @@ def connect() -> sqlite3.Connection:
     if "slot_at" not in [r["name"] for r in con.execute("PRAGMA table_info(sends)")]:
         con.execute("ALTER TABLE sends ADD COLUMN slot_at TEXT")
         con.commit()
-    if get_setting(con, "send_times") and not get_setting(con, "schedule_since"):
-        # upgrading from before the schedule floor existed: start it now so
-        # nothing the old code already handled is reconsidered
-        set_setting(con, "schedule_since", ts())
+        if get_setting(con, "send_times") and not get_setting(con, "schedule_since"):
+            # Upgrading from before the schedule floor existed: the current
+            # times took effect when their plist was written, so floor there
+            # (slots the old code slept through since then are still owed);
+            # without a plist, just far enough back that a firing this minute
+            # still counts.
+            since = now() - LATE_LIMIT
+            if plist_path().exists():
+                since = dt.datetime.fromtimestamp(plist_path().stat().st_mtime)
+            set_setting(con, "schedule_since", ts(since))
     return con
 
 
@@ -285,8 +291,10 @@ def send_imessage(recipient, text):
 
 
 def send_ntfy(topic, text):
-    """Returns (ok, error); ok is None on a timeout, since the push may have
-    gone out and the caller must not resend."""
+    """Returns (ok, error); ok is None when the response timed out after the
+    request went out (the push may have been delivered, so never resend).
+    A connect-phase failure, timeouts included, arrives wrapped in URLError
+    and is definite: nothing was sent."""
     try:
         req = urllib.request.Request(
             "https://ntfy.sh/" + topic, data=text.encode("utf-8"), method="POST"
@@ -294,12 +302,10 @@ def send_ntfy(topic, text):
         with urllib.request.urlopen(req, timeout=15):
             pass
         return True, None
-    except (socket.timeout, TimeoutError):
-        return None, "ntfy request timed out; it may have been delivered"
     except urllib.error.URLError as exc:
-        if isinstance(exc.reason, (socket.timeout, TimeoutError)):
-            return None, "ntfy request timed out; it may have been delivered"
         return False, str(exc)
+    except (socket.timeout, TimeoutError):
+        return None, "ntfy response timed out; it may have been delivered"
     except Exception as exc:
         return False, str(exc)
 
@@ -362,8 +368,12 @@ def do_send(con, slot, slot_dt=None):
                       "interrupted before the outcome was recorded", slot_at)
     for attempt, pause in enumerate((0,) + tuple(RETRY_PAUSES), 1):
         if pause:
+            # between attempts the outcome is definite: a kill during the
+            # pause must leave the occurrence retried, not retired
+            finish_send(con, row_id, channel, "failed", err)
             print("attempt %d failed (%s); retrying in %ds" % (attempt - 1, err, pause))
             time.sleep(pause)
+            finish_send(con, row_id, "-", "unknown", "interrupted before the outcome was recorded")
         channel, ok, err = deliver(con, msg["text"])
         if ok is not False:
             break
@@ -377,8 +387,8 @@ def do_send(con, slot, slot_dt=None):
     else:
         print("FAILED to send message %d via %s (slot %s): %s" % (msg["id"], channel, slot, err))
         earlier = slot_at and con.execute(
-            "SELECT 1 FROM sends WHERE slot_at = ? AND status = 'failed' AND id != ?",
-            (slot_at, row_id)).fetchone()
+            "SELECT 1 FROM sends WHERE slot_at = ? AND status = 'failed' AND id != ?"
+            " AND error NOT LIKE 'deferred:%'", (slot_at, row_id)).fetchone()
         if not earlier:  # one banner per occurrence, not one per retry round
             notify("manifest: send failed (slot %s)" % slot, err)
     return ok is not False
@@ -449,7 +459,7 @@ def missed_slots(con, times, at, late=LATE_LIMIT):
     for t in times:
         for day in (-1, 0):
             slot_dt = at_time(t, at + dt.timedelta(days=day))
-            if floor < slot_dt and at - slot_dt > late:
+            if floor < slot_dt and at - slot_dt >= late:
                 due[slot_dt] = t
     for t, slot_dt in failed_due(con, at):
         due.setdefault(slot_dt, t)
@@ -462,7 +472,7 @@ def catch_up_missed(con, times, at, late=LATE_LIMIT):
     wake for intervals missed during sleep; RunAtLoad covers a boot). Stops
     at the first delivery failure; the rest are recorded as failed so they
     stay due for the next run even across a schedule change.
-    Returns True if anything was attempted."""
+    Returns the occurrences that were due (attempted or deferred)."""
     missed = missed_slots(con, times, at, late)
     for i, (t, slot_dt) in enumerate(missed):
         print("catching up missed slot %s (%s)" % (t, slot_dt))
@@ -472,7 +482,7 @@ def catch_up_missed(con, times, at, late=LATE_LIMIT):
                          "deferred: an earlier catch-up failed", ts(slot_dt2))
             print("catch-up paused; %d slot(s) stay due for the next run" % (len(missed) - i - 1))
             break
-    return bool(missed)
+    return missed
 
 
 def set_schedule(con, times, at=None):
@@ -532,6 +542,8 @@ def run_slots(con, at):
                      "%dm %s for nearest slot %s, nothing missed to catch up" % (minutes, why, slot))
             print("skipped: %dm %s for nearest slot %s" % (minutes, why, slot))
         return
+    if slot_dt in [d for _, d in caught]:
+        return  # this occurrence was just attempted (its earlier try had failed)
     if already_handled(con, slot, slot_dt):
         log_send(con, None, slot, "-", "skipped", "already sent for slot %s today" % slot)
         print("skipped: already sent for slot %s today" % slot)
