@@ -257,12 +257,27 @@ class ManifestTest(unittest.TestCase):
         good = mock.Mock(returncode=0)
         bad = mock.Mock(returncode=1, stderr="Connection is invalid", stdout="")
         timeout = manifest.subprocess.TimeoutExpired("osascript", 60)
-        with mock.patch.object(manifest.time, "sleep"):
+        with mock.patch.object(manifest.time, "sleep"), \
+                mock.patch.object(manifest, "imessage_connected", lambda: None):
             with mock.patch.object(manifest.subprocess, "run", side_effect=[timeout]):
                 self.assertIsNone(REAL_SEND_IMESSAGE("+1", "hi")[0])
             # send fails, Messages launch hangs, second send succeeds
             with mock.patch.object(manifest.subprocess, "run", side_effect=[bad, timeout, good]):
                 self.assertEqual(REAL_SEND_IMESSAGE("+1", "hi"), (True, None))
+        # an offline iMessage account is refused before any send attempt
+        with mock.patch.object(manifest, "imessage_connected", lambda: False), \
+                mock.patch.object(manifest.subprocess, "run") as run:
+            ok, err = REAL_SEND_IMESSAGE("+1", "hi")
+        self.assertFalse(ok)
+        self.assertIn("not connected", err)
+        run.assert_not_called()
+        # the status probe tolerates a missing dictionary term
+        with mock.patch.object(manifest.subprocess, "run",
+                               return_value=mock.Mock(returncode=1, stdout="", stderr="syntax")):
+            self.assertIsNone(manifest.imessage_connected())
+        with mock.patch.object(manifest.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stdout="connecting\n")):
+            self.assertFalse(manifest.imessage_connected())
 
     def test_catch_up_stops_at_first_failure_and_resumes_later(self):
         run_cli("add", "hello")

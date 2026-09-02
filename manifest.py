@@ -175,20 +175,17 @@ on run argv
     set theRecipient to item 2 of argv
     tell application "Messages"
         set theAccount to 1st account whose service type = iMessage
-        -- Messages accepts a send while offline and later marks it "Not
-        -- Delivered"; refuse instead so the caller retries once connected.
-        try
-            set st to connection status of theAccount
-        on error
-            set st to missing value
-        end try
-        if st is not missing value and st is not connected then
-            error "iMessage account is " & (st as text)
-        end if
         send theText to participant theRecipient of theAccount
     end tell
 end run
 """
+
+# Kept separate from the send script: if this dictionary term is missing on
+# some macOS version the check is skipped instead of breaking every send.
+APPLESCRIPT_STATUS = (
+    'tell application "Messages" to get (connection status of'
+    ' (1st account whose service type = iMessage)) as text'
+)
 
 APPLESCRIPT_NOTIFY = """
 on run argv
@@ -197,11 +194,27 @@ end run
 """
 
 
+def imessage_connected():
+    """False when the iMessage account reports itself offline (Messages
+    would accept the send and later mark it "Not Delivered"); None when
+    the status cannot be read."""
+    try:
+        proc = subprocess.run([OSASCRIPT, "-e", APPLESCRIPT_STATUS],
+                              capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.strip() == "connected"
+
+
 def send_imessage(recipient, text):
     """Returns (ok, error): ok is True, False, or None when the outcome is
     unknown (osascript timed out — Messages may still deliver the queued
     event, so the caller must not resend). If the first try fails (e.g.
     Messages.app not running), launches Messages and retries once."""
+    if imessage_connected() is False:
+        return False, "iMessage account is not connected yet"
     proc = None
     for attempt in (1, 2):
         try:
