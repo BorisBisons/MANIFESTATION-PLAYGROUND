@@ -312,6 +312,40 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("today's random times", run_cli("shuffle"))
         self.assertEqual(manifest.get_setting(con, "shuffled_on"), "2026-09-02")
 
+    def _wake_replay_with_shuffle(self, shuffle_first):
+        """Random mode; day 1 slots 09:00/15:00/20:40; lid closed at 20:00, so
+        the Mac sleeps through 20:40 and the 00:10 reshuffle. On wake at
+        07:30 launchd replays both agents in an arbitrary order. Returns the
+        ok slots and the schedule after wake."""
+        run_cli("add", "one")
+        run_cli("add", "two")
+        with mock.patch.object(manifest, "random_times", lambda n: ["09:00", "15:00", "20:40"]):
+            self._freeze(dt.datetime(2026, 9, 1, 0, 10, 0))
+            run_cli("random", "3")
+        for hh, mm in ((9, 0), (15, 0)):
+            self._freeze(dt.datetime(2026, 9, 1, hh, mm, 2))
+            run_cli("run")
+        self._freeze(dt.datetime(2026, 9, 2, 7, 30, 0))
+        with mock.patch.object(manifest, "random_times", lambda n: ["10:00", "16:00", "21:10"]):
+            replays = [lambda: run_cli("shuffle"), lambda: run_cli("run")]
+            if not shuffle_first:
+                replays.reverse()
+            for replay in replays:
+                replay()
+            run_cli("run")  # RunAtLoad after the shuffle's reload
+        con = manifest.connect()
+        return self._ok_slots(), manifest.get_setting(con, "send_times")
+
+    def test_wake_replays_shuffle_then_run_exactly_once(self):
+        ok, times = self._wake_replay_with_shuffle(shuffle_first=True)
+        self.assertEqual(ok, ["09:00", "15:00", "20:40"])  # no 21:10 phantom, 20:40 once
+        self.assertEqual(times, "10:00,16:00,21:10")
+
+    def test_wake_replays_run_then_shuffle_exactly_once(self):
+        ok, times = self._wake_replay_with_shuffle(shuffle_first=False)
+        self.assertEqual(ok, ["09:00", "15:00", "20:40"])
+        self.assertEqual(times, "10:00,16:00,21:10")
+
     def test_fresh_install_does_not_backfill_earlier_slots(self):
         con = manifest.connect()
         con.execute("DELETE FROM settings")
