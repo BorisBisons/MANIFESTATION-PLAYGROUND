@@ -276,10 +276,12 @@ class ManifestTest(unittest.TestCase):
         timeout = manifest.subprocess.TimeoutExpired("osascript", 60)
         with mock.patch.object(manifest.time, "sleep"), \
                 mock.patch.object(manifest, "imessage_connected", lambda: None):
-            with mock.patch.object(manifest.subprocess, "run", side_effect=[timeout]):
+            # (first subprocess call is the guarded "launch Messages")
+            with mock.patch.object(manifest.subprocess, "run", side_effect=[good, timeout]):
                 self.assertIsNone(REAL_SEND_IMESSAGE("+1", "hi")[0])
-            # send fails, Messages launch hangs, second send succeeds
-            with mock.patch.object(manifest.subprocess, "run", side_effect=[bad, timeout, good]):
+            # launch hangs, send fails, relaunch hangs, second send succeeds
+            with mock.patch.object(manifest.subprocess, "run",
+                                   side_effect=[timeout, bad, timeout, good]):
                 self.assertEqual(REAL_SEND_IMESSAGE("+1", "hi"), (True, None))
         # an offline iMessage account is refused before any send attempt
         with mock.patch.object(manifest, "imessage_connected", lambda: False), \
@@ -287,7 +289,7 @@ class ManifestTest(unittest.TestCase):
             ok, err = REAL_SEND_IMESSAGE("+1", "hi")
         self.assertFalse(ok)
         self.assertIn("not connected", err)
-        run.assert_not_called()
+        self.assertEqual(run.call_count, 1)  # only the "launch Messages" nudge
         # the status probe tolerates a missing dictionary term
         with mock.patch.object(manifest.subprocess, "run",
                                return_value=mock.Mock(returncode=1, stdout="", stderr="syntax")):
@@ -336,7 +338,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(plist["ThrottleInterval"], manifest.RELAUNCH_INTERVAL)
         self.assertEqual(plist["EnvironmentVariables"]["MANIFEST_HOME"], self.tmp.name)
 
-    def test_no_message_skip_does_not_burn_the_slot(self):
+    def test_no_message_skip_does_not_burn_the_just_fired_slot(self):
         self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
         self.assertIn("no active messages", run_cli("run"))
         run_cli("add", "hello")
@@ -441,6 +443,7 @@ class ManifestTest(unittest.TestCase):
         run_cli("add", "hello")
         con = manifest.connect()
         manifest.set_setting(con, "send_times", "08:50")
+        manifest.set_setting(con, "schedule_since", "2026-09-02T00:00:00")
         self._freeze(dt.datetime(2026, 9, 2, 9, 0, 0))  # lid opened, 08:50 only 10 min old
         run_cli("times", "10:00")  # the replayed shuffle wins the race
         self.assertEqual(self._ok_slots(), ["08:50"])
@@ -611,12 +614,53 @@ class ManifestTest(unittest.TestCase):
 
     def test_same_clock_time_on_different_days_are_distinct_occurrences(self):
         run_cli("add", "hello")
-        self._freeze(dt.datetime(2026, 9, 2, 20, 45, 0))  # off for a day, back near 21:00
+        self._freeze(dt.datetime(2026, 9, 2, 20, 45, 0))  # off since install, back near 21:00
         run_cli("run")
-        self.assertEqual(self._ok_slots(), ["21:00", "08:00", "13:00"])
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00", "21:00", "08:00", "13:00"])
         self._freeze(dt.datetime(2026, 9, 2, 21, 0, 2))
         run_cli("run")  # today's 21:00 is a different occurrence from yesterday's
-        self.assertEqual(self._ok_slots(), ["21:00", "08:00", "13:00", "21:00"])
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00", "21:00", "08:00", "13:00", "21:00"])
+
+    def test_backlog_over_several_days_is_delivered_oldest_first(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 21, 0, 3))
+        run_cli("run")  # 08:00 and 13:00 caught up, 21:00 on time
+        self._freeze(dt.datetime(2026, 9, 4, 10, 0, 0))  # shut in a bag Sep 1 evening .. Sep 4
+        run_cli("run")
+        con = manifest.connect()
+        rows = con.execute("SELECT slot_at FROM sends WHERE status = 'ok' ORDER BY id").fetchall()
+        self.assertEqual([r["slot_at"] for r in rows][3:], [
+            "2026-09-02T08:00:00", "2026-09-02T13:00:00", "2026-09-02T21:00:00",
+            "2026-09-03T08:00:00", "2026-09-03T13:00:00", "2026-09-03T21:00:00",
+            "2026-09-04T08:00:00"])
+
+    def test_message_less_occurrences_do_not_burst_when_a_message_is_added(self):
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
+        run_cli("run")  # no messages: the just-fired 08:00 stays due for a while
+        self._freeze(dt.datetime(2026, 9, 1, 13, 0, 5))
+        run_cli("run")  # 08:00 is caught up empty and retired; 13:00 stays due
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 13, 10, 0))
+        run_cli("run")
+        self.assertEqual(self._ok_slots(), ["13:00"])  # still inside its window; 08:00 retired
+        self._freeze(dt.datetime(2026, 9, 1, 13, 25, 0))
+        run_cli("run")
+        self.assertEqual(self._ok_slots(), ["13:00"])
+
+    def test_wrapper_carries_manifest_home(self):
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}):
+            run_cli("install", "--recipient", "+15550001111")
+        text = (Path(self.tmp.name) / ".local" / "bin" / "manifest").read_text()
+        self.assertIn('MANIFEST_HOME="%s"' % self.tmp.name, text)
+
+    def test_uninstall_retires_still_owed_failures(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 30, 0))
+        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+            run_cli("run", expect_exit=1)
+        run_cli("uninstall")
+        con = manifest.connect()
+        self.assertEqual(manifest.failed_due(con, manifest.now()), [])
 
     def test_rows_from_before_slot_at_still_dedupe(self):
         run_cli("add", "hello")

@@ -29,7 +29,7 @@ LATE_LIMIT = dt.timedelta(minutes=20)
 CATCHUP_PAUSE = 3  # seconds between catch-up sends so they arrive one by one
 RETRY_PAUSES = (5, 10, 15, 30, 60)  # seconds before each retry: Wi-Fi and iMessage need a moment after wake
 RELAUNCH_INTERVAL = 300  # launchd relaunches `run` this often while a delivery is still failing
-OWED_FOR = dt.timedelta(days=3)  # a failed occurrence stays due this long
+OWED_FOR = dt.timedelta(days=3)  # how far back a missed or failed occurrence stays due
 SCRIPT = Path(__file__).resolve()
 OSASCRIPT = "/usr/bin/osascript"
 # The interpreter launchd runs; Automation permission is granted per binary,
@@ -173,8 +173,8 @@ def log_send(con, message_id, slot, channel, status, error=None, slot_at=None):
 
 
 def finish_send(con, row_id, channel, status, error):
-    con.execute("UPDATE sends SET channel = ?, status = ?, error = ? WHERE id = ?",
-                (channel, status, error, row_id))
+    con.execute("UPDATE sends SET channel = ?, status = ?, error = ?, sent_at = ? WHERE id = ?",
+                (channel, status, error, ts(), row_id))
     con.commit()
 
 
@@ -256,6 +256,13 @@ def send_imessage(recipient, text):
     unknown (osascript timed out — Messages may still deliver the queued
     event, so the caller must not resend). If the first try fails (e.g.
     Messages.app not running), launches Messages and retries once."""
+    try:
+        # after a cold boot Messages can take a while to start; do not spend
+        # the probe's and the send's timeouts on that
+        subprocess.run([OSASCRIPT, "-e", 'tell application "Messages" to launch'],
+                       capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     if imessage_connected() is False:
         return False, "iMessage account is not connected yet"
     proc = None
@@ -349,7 +356,7 @@ def pace(con):
             time.sleep(CATCHUP_PAUSE - gap)
 
 
-def do_send(con, slot, slot_dt=None):
+def do_send(con, slot, slot_dt=None, catching_up=False):
     """Pick a message and deliver it for one slot occurrence, retrying with
     a growing pause. Returns False only when delivery failed (a failed
     occurrence stays due and is retried on the next run); an unknown outcome
@@ -357,8 +364,11 @@ def do_send(con, slot, slot_dt=None):
     slot_at = ts(slot_dt) if slot_dt else None
     msg = pick_message(con)
     if msg is None:
-        # no slot_at: the occurrence stays due until a message exists
-        log_send(con, None, slot, "-", "skipped", "no active messages")
+        # A just-fired slot stays due until a message exists (add one within
+        # 20 min and it still goes out); an occurrence being caught up later
+        # is retired, so the first `add` never triggers a burst of old slots.
+        log_send(con, None, slot, "-", "skipped", "no active messages",
+                 slot_at if catching_up else None)
         print("skipped: no active messages (add one: manifest add \"...\")")
         return True
     pace(con)
@@ -442,8 +452,8 @@ def already_handled(con, slot, slot_dt):
 def schedule_floor(con, at):
     """Catch-up never looks before the schedule was last (re)written — the
     new times are never projected back onto a past that ran on old ones —
-    nor more than 24 h back."""
-    floor = at - dt.timedelta(hours=24)
+    nor more than OWED_FOR back."""
+    floor = at - OWED_FOR
     since = get_setting(con, "schedule_since")
     return max(floor, dt.datetime.fromisoformat(since)) if since else floor
 
@@ -452,12 +462,12 @@ def missed_slots(con, times, at, late=LATE_LIMIT):
     """Slot occurrences that came and went without being handled, oldest
     first: more than `late` past, after the schedule floor, and with no
     ok/skipped/unknown record — plus every occurrence whose delivery failed
-    in the last 24 h, which stays due as a row even if the schedule has
+    within OWED_FOR, which stays due as a row even if the schedule has
     since changed."""
     floor = schedule_floor(con, at)
     due = {}
     for t in times:
-        for day in (-1, 0):
+        for day in range(-OWED_FOR.days, 1):
             slot_dt = at_time(t, at + dt.timedelta(days=day))
             if floor < slot_dt and at - slot_dt >= late:
                 due[slot_dt] = t
@@ -476,7 +486,7 @@ def catch_up_missed(con, times, at, late=LATE_LIMIT):
     missed = missed_slots(con, times, at, late)
     for i, (t, slot_dt) in enumerate(missed):
         print("catching up missed slot %s (%s)" % (t, slot_dt))
-        if not do_send(con, t, slot_dt):
+        if not do_send(con, t, slot_dt, catching_up=True):
             for t2, slot_dt2 in missed[i + 1:]:
                 log_send(con, None, t2, "-", "failed",
                          "deferred: an earlier catch-up failed", ts(slot_dt2))
@@ -507,9 +517,10 @@ def cmd_run(args):
     print("[%s] run (power: %s)" % (ts(at), power_source()))
     try:
         run_slots(con, at)
-        # a run can span a sleep or a long retry ladder: re-check on a fresh clock
-        if now() - at > LATE_LIMIT:
-            catch_up_missed(con, send_times(con), now())
+        # a run can span a sleep or a long retry ladder: whatever fired
+        # meanwhile is handled on a fresh clock
+        if now() - at > WAKE_LEAD:
+            run_slots(con, now())
     except Exception as exc:
         # a bug must not become a 5-minute relaunch loop: report it and let
         # the next calendar firing try again
@@ -988,7 +999,9 @@ def cmd_install(args):
     bin_dir = Path("~/.local/bin").expanduser()
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper = bin_dir / "manifest"
-    wrapper.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (PYTHON, SCRIPT))
+    env = ('MANIFEST_HOME="%s" ' % os.environ["MANIFEST_HOME"]
+           if os.environ.get("MANIFEST_HOME") else "")
+    wrapper.write_text('#!/bin/sh\nexec %s"%s" "%s" "$@"\n' % (env, PYTHON, SCRIPT))
     wrapper.chmod(0o755)
     print("command installed: %s (python: %s — grant this one Automation access)" % (wrapper, PYTHON))
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
@@ -1016,7 +1029,9 @@ def cmd_uninstall(args):
             set_setting(con, "autowake", "")
             print("scheduled wakes cancelled; drop the sudo rule with: sudo rm %s" % SUDOERS_FILE)
     # the next install restarts the catch-up floor: slots that pass while
-    # uninstalled are not owed
+    # uninstalled are not owed, and neither are failures from before
+    for slot, slot_dt in failed_due(con, now()):
+        log_send(con, None, slot, "-", "skipped", "uninstalled while still due", ts(slot_dt))
     con.execute("DELETE FROM settings WHERE key = 'schedule_since'")
     con.commit()
     wrapper = Path("~/.local/bin/manifest").expanduser()
