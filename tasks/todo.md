@@ -32,7 +32,8 @@
 
 ## Follow-up: wake catch-up (user request, 2026-09-02)
 - [x] Opening the Mac now fires missed sends right away, one by one: `run` first calls `catch_up_missed`, which sends one message per slot missed while asleep (oldest first, `CATCHUP_PAUSE`=3 s apart), then handles the current firing's slot as before. A slot counts as missed when it's >20 min past and newer than the last send record (any status), capped at 24 h back — midnight on a fresh history — so nothing ever double-sends or resurrects ancient slots. The old ">20 min late → skipped" log now only happens when there was nothing to catch up (e.g. a mid-gap kickstart). README sleep paragraph rewritten; 5 new/updated tests, 22 total, all pass.
-- [ ] On-Mac verification: close the lid across a slot, open it, confirm the missed message arrives within seconds (`manifest stats` + Messages)
+- [x] Power-off coverage: launchd fires missed intervals on wake but not at boot, so the send agent's plist now sets `RunAtLoad` — login after a shutdown runs the agent once and the same catch-up/dedupe logic backfills what was missed (or logs a harmless skip when nothing was). Shuffle agent deliberately left without `RunAtLoad` (a per-login reshuffle would move slots mid-day).
+- [ ] On-Mac verification: close the lid across a slot, open it, confirm the missed message arrives within seconds (`manifest stats` + Messages); same after a full shutdown across a slot (needs `manifest times ...` once to regenerate the plist with RunAtLoad)
 
 ## Review
 - Shipped as one file (`manifest.py`, ~430 lines) + tests + README. No dependencies, stdlib only.

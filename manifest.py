@@ -323,6 +323,9 @@ def build_plist(con):
         "Label": LABEL,
         "ProgramArguments": [sys.executable, str(SCRIPT), "run"],
         "StartCalendarInterval": entries,
+        # launchd fires missed intervals on wake but NOT at boot; RunAtLoad
+        # makes login run the agent so catch-up also covers a powered-off Mac.
+        "RunAtLoad": True,
         "StandardOutPath": str(home_dir() / "launchd.log"),
         "StandardErrorPath": str(home_dir() / "launchd.log"),
     }

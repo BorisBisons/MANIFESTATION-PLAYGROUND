@@ -226,6 +226,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(plist["StartCalendarInterval"],
                          [{"Hour": 8, "Minute": 0}, {"Hour": 21, "Minute": 30}])
         self.assertEqual(plist["ProgramArguments"][2], "run")
+        self.assertTrue(plist["RunAtLoad"])  # boot/login also triggers catch-up
 
     def test_stats_counts_come_from_sends(self):
         run_cli("add", "one")
