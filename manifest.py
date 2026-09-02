@@ -29,8 +29,12 @@ LATE_LIMIT = dt.timedelta(minutes=20)
 CATCHUP_PAUSE = 3  # seconds between catch-up sends so they arrive one by one
 RETRY_PAUSES = (5, 10, 15, 30, 60)  # seconds before each retry: Wi-Fi and iMessage need a moment after wake
 RELAUNCH_INTERVAL = 300  # launchd relaunches `run` this often while a delivery is still failing
+OWED_FOR = dt.timedelta(days=3)  # a failed occurrence stays due this long
 SCRIPT = Path(__file__).resolve()
 OSASCRIPT = "/usr/bin/osascript"
+# The interpreter launchd runs; Automation permission is granted per binary,
+# so it is pinned at install time (override with MANIFEST_PYTHON).
+PYTHON = os.environ.get("MANIFEST_PYTHON") or sys.executable
 
 
 def home_dir() -> Path:
@@ -275,7 +279,7 @@ def send_imessage(recipient, text):
         err += (
             " | Automation permission is missing for the launchd path: "
             "System Settings > Privacy & Security > Automation, allow "
-            "'%s' (and %s) to control Messages." % (sys.executable, OSASCRIPT)
+            "'%s' (and %s) to control Messages." % (PYTHON, OSASCRIPT)
         )
     return False, err
 
@@ -381,11 +385,12 @@ def do_send(con, slot, slot_dt=None):
 
 
 def failed_due(con, at):
-    """Occurrences whose delivery failed in the last 24 h and are still
-    unhandled — what keeps `run` exiting non-zero so launchd relaunches it."""
+    """Occurrences whose delivery failed and are still unhandled — what keeps
+    `run` exiting non-zero so launchd relaunches it. A failure stays owed for
+    OWED_FOR (longer than the 24 h catch-up lookback: we tried, so it counts)."""
     rows = con.execute(
         "SELECT DISTINCT slot, slot_at FROM sends WHERE status = 'failed'"
-        " AND slot_at IS NOT NULL AND slot_at > ?", (ts(at - dt.timedelta(hours=24)),))
+        " AND slot_at IS NOT NULL AND slot_at > ?", (ts(at - OWED_FOR),))
     return [(r["slot"], dt.datetime.fromisoformat(r["slot_at"])) for r in rows
             if not already_handled(con, r["slot"], dt.datetime.fromisoformat(r["slot_at"]))]
 
@@ -517,11 +522,11 @@ def run_slots(con, at):
     caught = catch_up_missed(con, times, at)
     slot, slot_dt = resolve_slot(times, at)
     lateness = at - slot_dt
-    if lateness < dt.timedelta(0) or lateness > LATE_LIMIT or slot_dt < schedule_floor(con, at):
+    if lateness < dt.timedelta(0) or lateness > LATE_LIMIT or slot_dt <= schedule_floor(con, at):
         if not caught:
             minutes = int(abs(lateness).total_seconds() // 60)
             why = "late" if lateness > dt.timedelta(0) else "early"
-            if slot_dt < schedule_floor(con, at):
+            if slot_dt <= schedule_floor(con, at):
                 why += ", predates the current schedule"
             log_send(con, None, slot, "-", "skipped",
                      "%dm %s for nearest slot %s, nothing missed to catch up" % (minutes, why, slot))
@@ -539,7 +544,7 @@ def run_slots(con, at):
 def agent_plist(label, command, entries):
     plist = {
         "Label": label,
-        "ProgramArguments": [sys.executable, str(SCRIPT), command],
+        "ProgramArguments": [PYTHON, str(SCRIPT), command],
         "StartCalendarInterval": entries,
         # launchd fires missed intervals on wake but NOT at boot; RunAtLoad
         # makes login run the agent so catch-up also covers a powered-off Mac.
@@ -790,12 +795,14 @@ def cmd_shuffle(args, force=False):
     today = str(now().date())
     if not force and get_setting(con, "shuffled_on") == today:
         print("already shuffled today: %s" % ", ".join(send_times(con)))
+        if sys.platform == "darwin" and not agent_loaded(LABEL):
+            reload_agent(con)  # an earlier reload failed: the KeepAlive relaunch retries it
         return
     times = random_times(int(count))
     set_schedule(con, times)
-    set_setting(con, "shuffled_on", today)
     print("today's random times: %s" % ", ".join(times))
     reload_agent(con)
+    set_setting(con, "shuffled_on", today)  # only once the new schedule is loaded
 
 
 def cmd_random(args):
@@ -969,9 +976,9 @@ def cmd_install(args):
     bin_dir = Path("~/.local/bin").expanduser()
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper = bin_dir / "manifest"
-    wrapper.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, SCRIPT))
+    wrapper.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (PYTHON, SCRIPT))
     wrapper.chmod(0o755)
-    print("command installed: %s" % wrapper)
+    print("command installed: %s (python: %s — grant this one Automation access)" % (wrapper, PYTHON))
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         print('  NOTE: %s is not on your PATH; add: export PATH="%s:$PATH"' % (bin_dir, bin_dir))
 

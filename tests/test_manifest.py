@@ -456,6 +456,39 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("predates the current schedule", out)
         self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
 
+    def test_slot_at_the_exact_switch_second_is_not_sent(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        run_cli("times", "15:00", "21:00")
+        self.assertIn("predates the current schedule", run_cli("run"))
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
+
+    def test_shuffle_marks_the_day_only_after_the_reload(self):
+        self._freeze(dt.datetime(2026, 9, 1, 0, 10, 0))
+        run_cli("random", "3")
+        con = manifest.connect()
+        con.execute("DELETE FROM settings WHERE key = 'shuffled_on'")
+        con.commit()
+        with mock.patch.object(manifest, "reload_agent", side_effect=SystemExit("bootstrap failed")):
+            with self.assertRaises(SystemExit):
+                run_cli("shuffle")
+        self.assertIsNone(manifest.get_setting(con, "shuffled_on"))  # a relaunch will retry
+        run_cli("shuffle")
+        self.assertEqual(manifest.get_setting(con, "shuffled_on"), "2026-09-01")
+
+    def test_failed_occurrence_stays_owed_for_days(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 30, 0))
+        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+            run_cli("run", expect_exit=1)
+        self._freeze(dt.datetime(2026, 9, 3, 12, 0, 0))  # closed for two days
+        run_cli("run")
+        self.assertIn("08:00", self._ok_slots())
+        con = manifest.connect()
+        self.assertEqual(con.execute(
+            "SELECT slot_at FROM sends WHERE status = 'ok' AND slot = '08:00'").fetchone()["slot_at"],
+            "2026-09-01T08:00:00")
+
     def test_upgrade_starts_the_floor_at_the_first_connect(self):
         con = manifest.connect()
         con.execute("DELETE FROM settings WHERE key = 'schedule_since'")
