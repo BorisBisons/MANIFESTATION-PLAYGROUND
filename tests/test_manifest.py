@@ -118,17 +118,63 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(con.execute(
             "SELECT COUNT(*) AS n FROM sends WHERE status='ok'").fetchone()["n"], 1)
 
-    def test_run_more_than_20_minutes_late_skips(self):
+    def test_run_late_after_wake_catches_up_missed_slot(self):
         run_cli("add", "hello")
         self._freeze(dt.datetime(2026, 9, 1, 8, 25, 0))
         out = run_cli("run")
-        self.assertIn("skipped", out)
-        self.assertEqual(self.sent, [])
+        self.assertIn("catching up", out)
+        self.assertEqual([t for _, t in self.sent], ["hello"])
         con = manifest.connect()
-        self.assertEqual(con.execute("SELECT status FROM sends").fetchone()["status"], "skipped")
+        row = con.execute("SELECT slot, status FROM sends").fetchone()
+        self.assertEqual((row["slot"], row["status"]), ("08:00", "ok"))
+
+    def test_wake_catches_up_all_missed_slots_one_by_one(self):
+        run_cli("add", "one")
+        run_cli("add", "two")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        with mock.patch.object(manifest, "CATCHUP_PAUSE", 0):
+            run_cli("run")
+        con = manifest.connect()
+        rows = con.execute("SELECT slot, status FROM sends ORDER BY id").fetchall()
+        self.assertEqual([(r["slot"], r["status"]) for r in rows],
+                         [("08:00", "ok"), ("13:00", "ok")])
+        # one message per missed slot, rotating through the pool
+        self.assertEqual(len(self.sent), 2)
+        self.assertNotEqual(self.sent[0][1], self.sent[1][1])
+
+    def test_catch_up_skips_slots_already_handled(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
+        run_cli("run")  # 08:00 sent on time
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        run_cli("run")  # slept through 13:00 only
+        con = manifest.connect()
+        ok = con.execute("SELECT slot FROM sends WHERE status = 'ok' ORDER BY id").fetchall()
+        self.assertEqual([r["slot"] for r in ok], ["08:00", "13:00"])
+
+    def test_run_with_nothing_missed_still_skips(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
+        run_cli("run")
+        self._freeze(dt.datetime(2026, 9, 1, 10, 0, 0))
+        out = run_cli("run")  # kickstart mid-gap: 08:00 handled, 13:00 far off
+        self.assertIn("skipped", out)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_wake_next_morning_catches_up_last_nights_slot(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 13, 0, 5))
+        with mock.patch.object(manifest, "CATCHUP_PAUSE", 0):
+            run_cli("run")  # awake at 13:00 (fresh history also backfills 08:00)
+            self._freeze(dt.datetime(2026, 9, 2, 7, 30, 0))
+            run_cli("run")  # slept through 21:00, opened the lid next morning
+        con = manifest.connect()
+        ok = con.execute("SELECT slot FROM sends WHERE status = 'ok' ORDER BY id").fetchall()
+        self.assertEqual([r["slot"] for r in ok], ["08:00", "13:00", "21:00"])
 
     def test_run_within_window_before_slot_sends(self):
         run_cli("add", "hello")
+        run_cli("times", "13:00")
         self._freeze(dt.datetime(2026, 9, 1, 12, 55, 0))
         self.assertIn("sent", run_cli("run"))
         con = manifest.connect()

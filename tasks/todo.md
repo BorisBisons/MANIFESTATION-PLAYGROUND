@@ -30,6 +30,10 @@
 ## Follow-up: daily random times (user request)
 - [x] `manifest random N` — N random times/day in 08:00–21:30, ≥40 min apart (min-gap sampling, always valid); a second launchd agent `com.manifest.shuffle` reshuffles at 00:10 nightly and reloads the send agent (separate label so it never kills itself mid-reload); `random off` removes it; `uninstall` cleans up both agents; `times` warns when the shuffler will override it. 3 new tests, 18 total, all pass. Caveat: if the Mac sleeps through 00:10, yesterday's times persist until the next shuffle.
 
+## Follow-up: wake catch-up (user request, 2026-09-02)
+- [x] Opening the Mac now fires missed sends right away, one by one: `run` first calls `catch_up_missed`, which sends one message per slot missed while asleep (oldest first, `CATCHUP_PAUSE`=3 s apart), then handles the current firing's slot as before. A slot counts as missed when it's >20 min past and newer than the last send record (any status), capped at 24 h back — midnight on a fresh history — so nothing ever double-sends or resurrects ancient slots. The old ">20 min late → skipped" log now only happens when there was nothing to catch up (e.g. a mid-gap kickstart). README sleep paragraph rewritten; 5 new/updated tests, 22 total, all pass.
+- [ ] On-Mac verification: close the lid across a slot, open it, confirm the missed message arrives within seconds (`manifest stats` + Messages)
+
 ## Review
 - Shipped as one file (`manifest.py`, ~430 lines) + tests + README. No dependencies, stdlib only.
 - 15 unit tests pass (rotation fairness, no-repeat, single-message repeat, none-active skip, on-time send, per-slot dedupe, 20-min late skip, midnight slot wraparound, failed-send logging, no-recipient safety, times validation, plist generation, stats, ntfy channel).

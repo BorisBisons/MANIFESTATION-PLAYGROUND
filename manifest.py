@@ -22,6 +22,7 @@ LABEL = "com.manifest.agent"
 SHUFFLE_LABEL = "com.manifest.shuffle"
 DEFAULT_TIMES = "08:00,13:00,21:00"
 LATE_LIMIT = dt.timedelta(minutes=20)
+CATCHUP_PAUSE = 3  # seconds between catch-up sends so they arrive one by one
 SCRIPT = Path(__file__).resolve()
 OSASCRIPT = "/usr/bin/osascript"
 
@@ -250,19 +251,53 @@ def resolve_slot(times, at):
     return best[0], best[1]
 
 
+def catch_up_missed(con, times, at):
+    """Send every slot missed while the Mac slept, one by one, oldest first.
+    launchd fires the agent once on wake for intervals missed during sleep;
+    a slot occurrence counts as missed when it is more than LATE_LIMIT past
+    and nothing has been logged since it happened. Lookback stops at the most
+    recent send record (any status), at most 24 h; with no history, midnight.
+    Returns True if anything was caught up."""
+    last = con.execute("SELECT MAX(sent_at) AS t FROM sends").fetchone()["t"]
+    if last:
+        since = max(dt.datetime.fromisoformat(last), at - dt.timedelta(hours=24))
+    else:
+        since = at.replace(hour=0, minute=0, second=0, microsecond=0)
+    missed = []
+    for t in times:
+        hh, mm = t.split(":")
+        for day in (-1, 0):
+            slot_dt = (at + dt.timedelta(days=day)).replace(
+                hour=int(hh), minute=int(mm), second=0, microsecond=0
+            )
+            if since < slot_dt and at - slot_dt > LATE_LIMIT:
+                missed.append((t, slot_dt))
+    missed.sort(key=lambda pair: pair[1])
+    for i, (t, slot_dt) in enumerate(missed):
+        if i:
+            time.sleep(CATCHUP_PAUSE)
+        print("catching up missed slot %s (%s)" % (t, slot_dt))
+        do_send(con, t)
+    return bool(missed)
+
+
 def cmd_run(args):
-    """launchd entry point: figure out which slot this firing is for, enforce
-    one send per slot per day and the 20-minute lateness cutoff, then send."""
+    """launchd entry point: first catch up slots missed while the Mac slept,
+    then figure out which slot this firing is for, enforce one send per slot
+    per day and the 20-minute window, and send."""
     con = connect()
     at = now()
-    slot, slot_dt = resolve_slot(send_times(con), at)
+    times = send_times(con)
+    caught = catch_up_missed(con, times, at)
+    slot, slot_dt = resolve_slot(times, at)
     lateness = at - slot_dt
     if abs(lateness) > LATE_LIMIT:
-        minutes = int(abs(lateness).total_seconds() // 60)
-        why = "late" if lateness > dt.timedelta(0) else "early"
-        log_send(con, None, slot, "-", "skipped",
-                 "%dm %s for nearest slot %s (no backfill)" % (minutes, why, slot))
-        print("skipped: %dm %s for nearest slot %s" % (minutes, why, slot))
+        if not caught:
+            minutes = int(abs(lateness).total_seconds() // 60)
+            why = "late" if lateness > dt.timedelta(0) else "early"
+            log_send(con, None, slot, "-", "skipped",
+                     "%dm %s for nearest slot %s, nothing missed to catch up" % (minutes, why, slot))
+            print("skipped: %dm %s for nearest slot %s" % (minutes, why, slot))
         return
     already = con.execute(
         "SELECT id FROM sends WHERE slot = ? AND status = 'ok' AND sent_at >= ?",
@@ -272,6 +307,8 @@ def cmd_run(args):
         log_send(con, None, slot, "-", "skipped", "already sent for slot %s today" % slot)
         print("skipped: already sent for slot %s today" % slot)
         return
+    if caught:
+        time.sleep(CATCHUP_PAUSE)
     do_send(con, slot)
 
 
