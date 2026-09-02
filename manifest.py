@@ -622,7 +622,7 @@ WAKE_LEAD = dt.timedelta(minutes=1)
 # Validate the rule before it lands in sudoers.d: a bad file there breaks sudo.
 SUDOERS_INSTALL = (
     'set -e; t=$(mktemp); printf "%s\\n" "$1" > "$t"; chmod 440 "$t"; '
-    'visudo -cf "$t"; chown root:wheel "$t"; mv "$t" ' + SUDOERS_FILE
+    'visudo -c -f "$t"; chown root:wheel "$t"; mv "$t" ' + SUDOERS_FILE
 )
 
 

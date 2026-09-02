@@ -1,3 +1,6 @@
 # Lessons
 
 - Don't order rotation by second-resolution timestamps: rapid sends tie on `sent_at` and starve a message. Order recency by the strictly-increasing send id instead (caught by the fairness test before shipping).
+- Exactly-once over wall-clock slots needs three things, not one: key every record by the slot *occurrence* (not its HH:MM name), floor catch-up at the last schedule change (so new times are never projected onto the past), and keep "still due" as persisted rows rather than re-deriving it from the current schedule. My first catch-up used "since the last row" and a name-based dedupe — it double-sent early-window slots, sent phantoms after every nightly reshuffle, and lost slots after a failed wake. Before shipping timing logic, simulate day-in-the-life timelines (wake replays of both agents in either order, offline wake, kill mid-send, schedule change mid-catch-up) exactly the way the finders did.
+- When two launchd agents can fire at the same instant (wake replay), a `bootout` from one kills the other mid-work: serialize them with a process lock and never hold it across an interactive prompt.
+- An unknown outcome (timeout, kill between deliver and log) must count as delivered: a possible missing text beats a certain duplicate. Claim the row before sending.
