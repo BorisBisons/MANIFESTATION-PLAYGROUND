@@ -3,6 +3,7 @@
 import datetime as dt
 import io
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import manifest
+
+REAL_SEND_IMESSAGE = manifest.send_imessage  # setUp mocks the module attribute
 
 
 def run_cli(*argv):
@@ -36,8 +39,14 @@ class ManifestTest(unittest.TestCase):
         patcher = mock.patch.object(manifest, "send_imessage", fake_send)
         patcher.start()
         self.addCleanup(patcher.stop)
+        for name, value in (("CATCHUP_PAUSE", 0), ("RETRY_PAUSES", (0,))):
+            p = mock.patch.object(manifest, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         con = manifest.connect()
         manifest.set_setting(con, "recipient", "+15550001111")
+        # as if installed at midnight on the day most tests freeze
+        manifest.set_setting(con, "schedule_since", "2026-09-01T00:00:00")
         con.close()
 
     # ---- message CRUD
@@ -174,11 +183,161 @@ class ManifestTest(unittest.TestCase):
 
     def test_run_within_window_before_slot_sends(self):
         run_cli("add", "hello")
-        run_cli("times", "13:00")
+        con = manifest.connect()
+        manifest.set_setting(con, "send_times", "13:00")
         self._freeze(dt.datetime(2026, 9, 1, 12, 55, 0))
         self.assertIn("sent", run_cli("run"))
-        con = manifest.connect()
         self.assertEqual(con.execute("SELECT slot FROM sends").fetchone()["slot"], "13:00")
+
+    def _ok_slots(self):
+        con = manifest.connect()
+        return [r["slot"] for r in
+                con.execute("SELECT slot FROM sends WHERE status = 'ok' ORDER BY id")]
+
+    def test_early_send_is_not_caught_up_again_after_a_later_wake(self):
+        run_cli("add", "hello")
+        con = manifest.connect()
+        manifest.set_setting(con, "send_times", "12:00,12:45")
+        self._freeze(dt.datetime(2026, 9, 1, 12, 27, 0))
+        run_cli("run")  # replay of 12:00; 12:45 is 18 min early so it goes too
+        self.assertEqual(self._ok_slots(), ["12:00", "12:45"])
+        self._freeze(dt.datetime(2026, 9, 1, 13, 10, 0))
+        run_cli("run")  # replay of 12:45 after another nap: already handled
+        self.assertEqual(self._ok_slots(), ["12:00", "12:45"])
+
+    def test_failed_catch_up_is_retried_on_the_next_run(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 30, 0))
+        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "network down")):
+            self.assertIn("FAILED", run_cli("run"))
+        self.assertEqual(self.sent, [])
+        self._freeze(dt.datetime(2026, 9, 1, 8, 45, 0))
+        run_cli("run")
+        self.assertEqual([t for _, t in self.sent], ["hello"])
+        con = manifest.connect()
+        self.assertEqual([r["status"] for r in con.execute(
+            "SELECT status FROM sends WHERE slot = '08:00' ORDER BY id")], ["failed", "ok"])
+
+    def test_send_retries_before_giving_up(self):
+        run_cli("add", "hello")
+        calls = []
+
+        def flaky(recipient, text):
+            calls.append(text)
+            return (True, None) if len(calls) == 2 else (False, "Messages not ready")
+
+        with mock.patch.object(manifest, "send_imessage", flaky):
+            out = run_cli("send-now")
+        self.assertIn("sent", out)
+        self.assertEqual(len(calls), 2)
+        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "nope")):
+            calls.clear()
+            self.assertIn("FAILED", run_cli("send-now"))
+
+    def test_unknown_outcome_counts_as_handled_and_is_not_resent(self):
+        run_cli("add", "hello")
+        calls = []
+
+        def hangs(recipient, text):
+            calls.append(text)
+            return None, "osascript timed out"
+
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
+        with mock.patch.object(manifest, "send_imessage", hangs):
+            out = run_cli("run")
+        self.assertIn("UNKNOWN", out)
+        self.assertEqual(len(calls), 1)  # no retry: Messages may still deliver it
+        self.assertIn("already sent", run_cli("run"))
+        con = manifest.connect()
+        self.assertEqual(con.execute(
+            "SELECT status FROM sends WHERE slot = '08:00'").fetchone()["status"], "unknown")
+        self.assertIn("unknown:     1", run_cli("stats"))
+
+    def test_send_imessage_timeout_and_launch_errors(self):
+        good = mock.Mock(returncode=0)
+        bad = mock.Mock(returncode=1, stderr="Connection is invalid", stdout="")
+        timeout = manifest.subprocess.TimeoutExpired("osascript", 60)
+        with mock.patch.object(manifest.time, "sleep"):
+            with mock.patch.object(manifest.subprocess, "run", side_effect=[timeout]):
+                self.assertIsNone(REAL_SEND_IMESSAGE("+1", "hi")[0])
+            # send fails, Messages launch hangs, second send succeeds
+            with mock.patch.object(manifest.subprocess, "run", side_effect=[bad, timeout, good]):
+                self.assertEqual(REAL_SEND_IMESSAGE("+1", "hi"), (True, None))
+
+    def test_catch_up_stops_at_first_failure_and_resumes_later(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        with mock.patch.object(manifest, "send_imessage", lambda r, t: (False, "offline")):
+            out = run_cli("run")
+        self.assertIn("catch-up paused; 1 slot(s) stay due", out)
+        con = manifest.connect()
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) AS n FROM sends WHERE status = 'failed'").fetchone()["n"], 1)
+        run_cli("run")  # back online
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
+
+    def test_changing_times_finishes_old_schedule_and_never_backfills_new(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        run_cli("times", "09:00", "14:00", "20:00")  # 08:00 and 13:00 were pending
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
+        out = run_cli("run")  # what RunAtLoad does right after the reload
+        self.assertIn("skipped", out)
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])  # no 09:00/14:00 phantoms
+
+    def test_shuffle_runs_once_per_day_unless_forced(self):
+        self._freeze(dt.datetime(2026, 9, 1, 0, 10, 0))
+        run_cli("random", "5")
+        con = manifest.connect()
+        first = manifest.get_setting(con, "send_times")
+        self.assertEqual(manifest.get_setting(con, "shuffled_on"), "2026-09-01")
+        self.assertIn("already shuffled today", run_cli("shuffle"))
+        self.assertEqual(manifest.get_setting(con, "send_times"), first)
+        self._freeze(dt.datetime(2026, 9, 2, 7, 30, 0))  # off through 00:10, login replay
+        self.assertIn("today's random times", run_cli("shuffle"))
+        self.assertEqual(manifest.get_setting(con, "shuffled_on"), "2026-09-02")
+
+    def test_fresh_install_does_not_backfill_earlier_slots(self):
+        con = manifest.connect()
+        con.execute("DELETE FROM settings")
+        con.commit()
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}):
+            run_cli("install", "--recipient", "+15550001111")
+        self.assertIn("skipped", run_cli("run"))  # RunAtLoad right after bootstrap
+        self.assertEqual(self.sent, [])
+
+    def test_same_clock_time_on_different_days_are_distinct_occurrences(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 2, 20, 45, 0))  # off for a day, back near 21:00
+        run_cli("run")
+        # yesterday's 21:00, today's 08:00 and 13:00 caught up; today's 21:00 (15 min early) still sent
+        self.assertEqual(self._ok_slots(), ["21:00", "08:00", "13:00", "21:00"])
+
+    def test_rows_from_before_slot_at_still_dedupe(self):
+        run_cli("add", "hello")
+        con = manifest.connect()
+        con.execute("INSERT INTO sends (message_id, slot, sent_at, channel, status)"
+                    " VALUES (1, '08:00', '2026-09-01T08:00:04', 'imessage', 'ok')")
+        con.commit()
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 30))
+        self.assertIn("already sent", run_cli("run"))
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        run_cli("run")
+        self.assertEqual(self._ok_slots(), ["08:00", "13:00"])
+
+    def test_connect_migrates_old_db_without_slot_at(self):
+        old = tempfile.mkdtemp(dir=self.tmp.name)
+        raw = sqlite3.connect(Path(old) / "manifest.db")
+        raw.execute("CREATE TABLE sends (id INTEGER PRIMARY KEY, message_id INTEGER,"
+                    " slot TEXT NOT NULL, sent_at TEXT NOT NULL, channel TEXT NOT NULL,"
+                    " status TEXT NOT NULL, error TEXT)")
+        raw.commit()
+        raw.close()
+        os.environ["MANIFEST_HOME"] = old
+        con = manifest.connect()
+        self.assertIn("slot_at", [r["name"] for r in con.execute("PRAGMA table_info(sends)")])
 
     def test_resolve_slot_midnight_wraparound(self):
         slot, slot_dt = manifest.resolve_slot(
@@ -227,6 +386,9 @@ class ManifestTest(unittest.TestCase):
                          [{"Hour": 8, "Minute": 0}, {"Hour": 21, "Minute": 30}])
         self.assertEqual(plist["ProgramArguments"][2], "run")
         self.assertTrue(plist["RunAtLoad"])  # boot/login also triggers catch-up
+        shuffle = manifest.build_shuffle_plist()
+        self.assertEqual(shuffle["ProgramArguments"][2], "shuffle")
+        self.assertTrue(shuffle["RunAtLoad"])  # a login after an off night reshuffles
 
     def test_stats_counts_come_from_sends(self):
         run_cli("add", "one")
@@ -236,6 +398,43 @@ class ManifestTest(unittest.TestCase):
         self.assertIn("total sent:  2", out)
         self.assertIn("today:       2", out)
         self.assertIn("failures:    0", out)
+
+    # ---- power / autowake / status
+
+    def test_upcoming_wakes_lead_each_next_occurrence(self):
+        con = manifest.connect()
+        manifest.set_setting(con, "send_times", "08:00,21:30")
+        at = dt.datetime(2026, 9, 1, 9, 0)
+        self.assertEqual(manifest.upcoming_wakes(con, at),
+                         [dt.datetime(2026, 9, 1, 21, 29), dt.datetime(2026, 9, 2, 7, 59)])
+        # a slot less than the lead away is already too late to wake for
+        self.assertEqual(manifest.upcoming_wakes(con, dt.datetime(2026, 9, 1, 21, 29, 30))[0],
+                         dt.datetime(2026, 9, 2, 7, 59))
+        manifest.set_setting(con, "shuffle_count", "5")
+        self.assertIn(dt.datetime(2026, 9, 2, 0, 9), manifest.upcoming_wakes(con, at))
+
+    def test_pmset_date_format(self):
+        self.assertEqual(manifest.pmset_date(dt.datetime(2026, 9, 1, 7, 59)), "09/01/26 07:59:00")
+
+    def test_status_reports_missed_and_next_slot(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 15, 0, 0))
+        out = run_cli("status")
+        self.assertIn("missed now:  08:00, 13:00", out)
+        self.assertIn("next slot:   2026-09-01 21:00:00", out)
+        self.assertIn("last send:   never", out)
+        self.assertIn("autowake:    off", out)
+        with mock.patch.object(manifest, "CATCHUP_PAUSE", 0):
+            run_cli("run")
+        self.assertIn("missed now:  none", run_cli("status"))
+
+    def test_run_logs_power_and_never_schedules_wakes_off_macos(self):
+        run_cli("add", "hello")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
+        with mock.patch.object(manifest, "pmset_schedule") as pm:
+            out = run_cli("run")
+        self.assertIn("(power: unknown)", out)
+        pm.assert_not_called()
 
     # ---- random daily times
 
