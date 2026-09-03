@@ -864,7 +864,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(manifest.upcoming_wakes(con, dt.datetime(2026, 9, 1, 21, 29, 30))[0],
                          dt.datetime(2026, 9, 2, 7, 59))
         manifest.set_setting(con, "shuffle_count", "5")
-        self.assertIn(dt.datetime(2026, 9, 2, 0, 9), manifest.upcoming_wakes(con, at))
+        self.assertIn(dt.datetime(2026, 9, 1, 23, 59), manifest.upcoming_wakes(con, at))  # midnight reshuffle
 
     def test_pmset_date_format(self):
         self.assertEqual(manifest.pmset_date(dt.datetime(2026, 9, 1, 7, 59)), "09/01/26 07:59:00")
