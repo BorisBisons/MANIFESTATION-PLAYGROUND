@@ -399,14 +399,14 @@ class ManifestTest(unittest.TestCase):
         ok slots and the schedule after wake."""
         run_cli("add", "one")
         run_cli("add", "two")
-        with mock.patch.object(manifest, "random_times", lambda n: ["09:00", "15:00", "20:40"]):
+        with mock.patch.object(manifest, "random_times", lambda n, **kw: ["09:00", "15:00", "20:40"]):
             self._freeze(dt.datetime(2026, 9, 1, 0, 10, 0))
             run_cli("random", "3")
         for hh, mm in ((9, 0), (15, 0)):
             self._freeze(dt.datetime(2026, 9, 1, hh, mm, 2))
             run_cli("run")
         self._freeze(dt.datetime(2026, 9, 2, 7, 30, 0))
-        with mock.patch.object(manifest, "random_times", lambda n: ["10:00", "16:00", "21:10"]):
+        with mock.patch.object(manifest, "random_times", lambda n, **kw: ["10:00", "16:00", "21:10"]):
             replays = [lambda: run_cli("shuffle"), lambda: run_cli("run")]
             if not shuffle_first:
                 replays.reverse()
@@ -840,6 +840,7 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(plist["RunAtLoad"])  # boot/login also triggers catch-up
         shuffle = manifest.build_shuffle_plist()
         self.assertEqual(shuffle["ProgramArguments"][2], "shuffle")
+        self.assertEqual(shuffle["StartCalendarInterval"], [{"Hour": 0, "Minute": 0}])
         self.assertTrue(shuffle["RunAtLoad"])  # a login after an off night reshuffles
 
     def test_stats_counts_come_from_sends(self):
@@ -892,16 +893,38 @@ class ManifestTest(unittest.TestCase):
 
     def test_random_times_respect_window_gap_and_count(self):
         import random as _random
-        for seed in range(20):
-            rng = _random.Random(seed)
-            times = manifest.random_times(18, rng)
-            self.assertEqual(len(times), 18)
-            mins = [int(t[:2]) * 60 + int(t[3:]) for t in times]
-            self.assertEqual(mins, sorted(mins))
-            self.assertGreaterEqual(mins[0], manifest.WINDOW_START)
-            self.assertLessEqual(mins[-1], manifest.WINDOW_END)
-            self.assertGreaterEqual(min(b - a for a, b in zip(mins, mins[1:])),
-                                    manifest.MIN_GAP)
+        for window, count, lo, hi, most in (("08:00-21:30", 18, 8 * 60, 21 * 60 + 30, 21),
+                                            ("00:00-24:00", 36, 0, 24 * 60 - 1, 36)):
+            self.assertEqual(manifest.max_random(window), most)
+            for seed in range(20):
+                rng = _random.Random(seed)
+                times = manifest.random_times(count, rng, window)
+                self.assertEqual(len(times), count)
+                mins = [int(t[:2]) * 60 + int(t[3:]) for t in times]
+                self.assertEqual(mins, sorted(mins))
+                self.assertGreaterEqual(mins[0], lo)
+                self.assertLessEqual(mins[-1], hi)
+                self.assertGreaterEqual(min(b - a for a, b in zip(mins, mins[1:])),
+                                        manifest.MIN_GAP)
+                self.assertTrue(all(t < "24:00" for t in times))
+
+    def test_random_window_flags_persist_and_validate(self):
+        out = run_cli("random", "36", "--from", "00:00", "--to", "24:00")
+        self.assertIn("today's random times", out)
+        con = manifest.connect()
+        self.assertEqual(manifest.get_setting(con, "window"), "00:00-24:00")
+        self.assertEqual(len(manifest.send_times(con)), 36)
+        self.assertIn("in 00:00-24:00", run_cli("status"))
+        run_cli("shuffle")  # already today
+        self.assertEqual(len(manifest.send_times(con)), 36)
+        with self.assertRaises(SystemExit):
+            run_cli("random", "37", "--from", "00:00", "--to", "24:00")
+        with self.assertRaises(SystemExit):
+            run_cli("random", "5", "--from", "09:00")
+        with self.assertRaises(SystemExit):
+            run_cli("random", "5", "--from", "22:00", "--to", "02:00")
+        run_cli("random", "5")  # keeps the stored window
+        self.assertEqual(manifest.get_setting(con, "window"), "00:00-24:00")
 
     def test_random_command_sets_and_clears_shuffle(self):
         out = run_cli("random", "5")

@@ -24,6 +24,7 @@ from pathlib import Path
 
 LABEL = "com.manifest.agent"
 SHUFFLE_LABEL = "com.manifest.shuffle"
+SHUFFLE_TIME = "00:00"  # random mode redraws the day's times at midnight
 DEFAULT_TIMES = "08:00,13:00,21:00"
 LATE_LIMIT = dt.timedelta(minutes=20)
 CATCHUP_PAUSE = 3  # seconds between catch-up sends so they arrive one by one
@@ -635,7 +636,8 @@ def build_plist(con):
 
 
 def build_shuffle_plist():
-    return agent_plist(SHUFFLE_LABEL, "shuffle", [{"Hour": 0, "Minute": 10}])
+    hh, mm = SHUFFLE_TIME.split(":")
+    return agent_plist(SHUFFLE_LABEL, "shuffle", [{"Hour": int(hh), "Minute": int(mm)}])
 
 
 def load_agent(label, plist):
@@ -726,7 +728,7 @@ def upcoming_wakes(con, at):
     of every slot, and before the nightly shuffle when random times are on."""
     targets = [next_occurrence(t, at, WAKE_LEAD) for t in send_times(con)]
     if get_setting(con, "shuffle_count"):
-        targets.append(next_occurrence("00:10", at, WAKE_LEAD))
+        targets.append(next_occurrence(SHUFFLE_TIME, at, WAKE_LEAD))
     return sorted(t - WAKE_LEAD for t in targets)
 
 
@@ -809,7 +811,8 @@ def cmd_status(args):
     print("power:       %s" % power_source())
     print("channel:     %s -> %s" % (channel, target or "NOT SET (run: manifest install)"))
     print("times:       %s%s" % (", ".join(times),
-                                  "  (random %s/day, reshuffled 00:10)" % shuffle if shuffle else ""))
+                                  "  (random %s/day in %s, reshuffled %s)"
+                                  % (shuffle, window_text(con), SHUFFLE_TIME) if shuffle else ""))
     print("next slot:   %s" % min(next_occurrence(t, at) for t in times))
     missed = missed_slots(con, times, at)
     print("missed now:  %s" % (", ".join(t for t, _ in missed) + "  (sends on the next run)"
@@ -834,24 +837,52 @@ def cmd_status(args):
 
 # ---------------------------------------------------------------- random times
 
-WINDOW_START = 8 * 60        # 08:00
-WINDOW_END = 21 * 60 + 30    # 21:30
+DEFAULT_WINDOW = "08:00-21:30"
 MIN_GAP = 40                 # keeps every slot clear of its neighbours' 20-min windows
 
 
-def random_times(count, rng=random):
-    """`count` random times in the send window, each at least MIN_GAP apart:
+def parse_window(text):
+    """'HH:MM-HH:MM' -> (start, end) in minutes of the day; the end may be
+    24:00 and is exclusive (a slot can never land on 24:00 itself)."""
+    try:
+        a, b = text.split("-")
+        start = to_minutes(parse_time(a))
+        end = 24 * 60 if b.strip() == "24:00" else to_minutes(parse_time(b))
+    except ValueError:
+        sys.exit("window must look like HH:MM-HH:MM, e.g. 08:00-21:30 or 00:00-24:00")
+    if end <= start:
+        sys.exit("the window must end after it starts (it cannot cross midnight)")
+    return start, end
+
+
+def to_minutes(hh_mm):
+    hh, mm = hh_mm.split(":")
+    return int(hh) * 60 + int(mm)
+
+
+def window_text(con):
+    return get_setting(con, "window", DEFAULT_WINDOW)
+
+
+def max_random(window):
+    start, end = parse_window(window)
+    return (end - 1 - start) // MIN_GAP + 1
+
+
+def random_times(count, rng=random, window=DEFAULT_WINDOW):
+    """`count` random times in the window, each at least MIN_GAP apart:
     sorted uniform picks in the gap-reduced span, then the gaps re-inserted."""
-    slack = (WINDOW_END - WINDOW_START) - (count - 1) * MIN_GAP
+    start, end = parse_window(window)
+    slack = (end - 1 - start) - (count - 1) * MIN_GAP
     offsets = sorted(rng.uniform(0, slack) for _ in range(count))
-    return ["%02d:%02d" % divmod(WINDOW_START + int(o) + i * MIN_GAP, 60)
+    return ["%02d:%02d" % divmod(start + int(o) + i * MIN_GAP, 60)
             for i, o in enumerate(offsets)]
 
 
 def cmd_shuffle(args, force=False):
-    """Daily launchd entry point (separate agent, 00:10 and at login):
+    """Daily launchd entry point (separate agent, SHUFFLE_TIME and at login):
     pick fresh random times for today and reload the send agent. Once per
-    day unless forced, so a login replay after 00:10 already ran is a no-op."""
+    day unless forced, so a login replay after it already ran is a no-op."""
     acquire_lock()
     con = connect()
     count = get_setting(con, "shuffle_count")
@@ -864,7 +895,7 @@ def cmd_shuffle(args, force=False):
         if sys.platform == "darwin" and not agent_loaded(LABEL):
             reload_agent(con)  # an earlier reload failed: the KeepAlive relaunch retries it
         return
-    times = random_times(int(count))
+    times = random_times(int(count), window=window_text(con))
     set_schedule(con, times)
     print("today's random times: %s" % ", ".join(times))
     reload_agent(con)
@@ -885,13 +916,18 @@ def cmd_random(args):
         count = int(args.count)
     except ValueError:
         sys.exit("usage: manifest random <count>  (or: manifest random off)")
-    max_count = (WINDOW_END - WINDOW_START) // MIN_GAP + 1
+    window = "%s-%s" % (args.start, args.end) if args.start or args.end else window_text(con)
+    if (args.start is None) != (args.end is None):
+        sys.exit("give both --from and --to (e.g. --from 00:00 --to 24:00)")
+    max_count = max_random(window)
     if not 1 <= count <= max_count:
-        sys.exit("count must be 1-%d (times fit 08:00-21:30, %d min apart)" % (max_count, MIN_GAP))
+        sys.exit("count must be 1-%d (times fit %s, %d min apart)" % (max_count, window, MIN_GAP))
     set_setting(con, "shuffle_count", str(count))
+    set_setting(con, "window", window)
     if sys.platform == "darwin":
         load_agent(SHUFFLE_LABEL, build_shuffle_plist())
-        print("daily shuffler loaded: %d fresh random times every night at 00:10" % count)
+        print("daily shuffler loaded: %d fresh random times in %s every day at %s"
+              % (count, window, SHUFFLE_TIME))
     cmd_shuffle(args, force=True)
 
 
@@ -1035,7 +1071,7 @@ def cmd_install(args):
         set_setting(con, "schedule_since", ts())
     if get_setting(con, "shuffle_count") and get_setting(con, "shuffled_on") is None:
         # upgrading with random on: the current times are the draw made on
-        # the day the schedule took effect (a missed 00:10 then reshuffles)
+        # the day the schedule took effect (a missed reshuffle then happens at login)
         set_setting(con, "shuffled_on", get_setting(con, "schedule_since")[:10])
     if not con.execute("SELECT 1 FROM messages WHERE active = 1 AND deleted_at IS NULL").fetchone():
         print('NOTE: no messages yet — nothing sends until you: manifest add "..."')
@@ -1111,7 +1147,10 @@ def main(argv=None):
     s = sub.add_parser("channel", help="switch delivery channel")
     s.add_argument("channel", choices=["imessage", "ntfy"]); s.add_argument("--topic"); s.set_defaults(f=cmd_channel)
     s = sub.add_parser("random", help="N fresh random send times every day (or: off)")
-    s.add_argument("count", metavar="N|off"); s.set_defaults(f=cmd_random)
+    s.add_argument("count", metavar="N|off")
+    s.add_argument("--from", dest="start", metavar="HH:MM", help="window start (default 08:00)")
+    s.add_argument("--to", dest="end", metavar="HH:MM", help="window end, up to 24:00 (default 21:30)")
+    s.set_defaults(f=cmd_random)
     s = sub.add_parser("run", help="(launchd) send for the current slot"); s.set_defaults(f=cmd_run)
     s = sub.add_parser("shuffle", help="(launchd) re-randomize today's times"); s.set_defaults(f=cmd_shuffle)
     s = sub.add_parser("install", help="set up command, DB and launchd agent")
