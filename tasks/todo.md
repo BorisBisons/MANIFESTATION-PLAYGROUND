@@ -52,6 +52,9 @@ Facts checked: launchd replays sleep-missed StartCalendarInterval firings once o
 ## Follow-up: double the daily sends over 24 h (user request, 2026-09-02)
 - [x] `manifest random N --from HH:MM --to HH:MM` — the random window is now a setting (`window`, default 08:00–21:30; `--to 24:00` allowed, end exclusive); `random 36 --from 00:00 --to 24:00` fits exactly 36 slots at the 40-min minimum gap. The nightly reshuffle moved from 00:10 to 00:00 (`SHUFFLE_TIME`) so a slot drawn in the first minutes of the day is never lost to the switch. `status` shows the window. Owner runs on the mini: `git pull`, then `manifest random 36 --from 00:00 --to 24:00`.
 
+## Follow-up: statements as a file synced from GitHub (user request, 2026-10-06)
+- [x] `statements.txt` (one per line, `#` comments) is the source of truth: `sync_statements` runs before every send — `git fetch` of the checked-out branch + `git show origin/<branch>:statements.txt`, never touching the code — and adds new lines / pauses removed ones / resumes re-added ones, keeping history; offline → local copy; no file → no-op. `manifest sync` on demand. The file carries the reworded statements the owner approved. Needs one `git pull` + `manifest install` on the mini to start (the mini runs the checked-out code; it does not self-update). 4 new tests, 76 pass.
+
 ## Review
 - Shipped as one file (`manifest.py`, ~430 lines) + tests + README. No dependencies, stdlib only.
 - 15 unit tests pass (rotation fairness, no-repeat, single-message repeat, none-active skip, on-time send, per-slot dedupe, 20-min late skip, midnight slot wraparound, failed-send logging, no-recipient safety, times validation, plist generation, stats, ntfy channel).

@@ -1,0 +1,20 @@
+# One manifestation statement per line. This file is the source of truth:
+# the agent fetches it from GitHub before every send and keeps the message
+# list in sync (new lines are added, removed lines are paused). Lines
+# starting with # are comments.
+I am worthy of $100 million, and it is flowing to me
+I am a Canadian Armed Forces Aviation Systems Technician, trusted and skilled
+I have a beautiful wife and beautiful kids who love me
+I am grateful for the beautiful family that I have
+I own a thriving business that serves thousands
+I work and vacation whenever I choose; my time is my own
+I am blessed and I am a chosen one
+I have abundant peace
+I have abundant love
+I am sober
+I am a millionaire
+My net worth grows every single day
+I am kind
+I have a mighty powerful God
+I am thankful and grateful
+I own a world-famous entertainment streaming company

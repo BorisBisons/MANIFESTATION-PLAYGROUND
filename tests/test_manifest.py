@@ -51,6 +51,13 @@ class ManifestTest(unittest.TestCase):
         patcher = mock.patch.object(manifest, "send_imessage", fake_send)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # no statements file unless a test provides one
+        p = mock.patch.object(manifest, "fetch_statements", lambda: None)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(manifest, "SCRIPT", Path(self.tmp.name) / "manifest.py")
+        p.start()
+        self.addCleanup(p.stop)
         for name, value in (("CATCHUP_PAUSE", 0), ("RETRY_PAUSES", (0,))):
             p = mock.patch.object(manifest, name, value)
             p.start()
@@ -888,6 +895,35 @@ class ManifestTest(unittest.TestCase):
             out = run_cli("run")
         self.assertIn("(power: unknown)", out)
         pm.assert_not_called()
+
+    # ---- statements file
+
+    def test_sync_adds_pauses_and_resumes_from_github(self):
+        run_cli("add", "old wording")
+        run_cli("add", "keep me")
+        with mock.patch.object(manifest, "fetch_statements",
+                               lambda: ["new wording", "keep me", "brand new"]):
+            out = run_cli("sync")
+        self.assertIn("2 added, 1 paused, 0 resumed", out)
+        self.assertIn("[paused]", out.split("old wording")[0].splitlines()[-1])
+        with mock.patch.object(manifest, "fetch_statements", lambda: ["old wording"]):
+            out = run_cli("sync")
+        self.assertIn("0 added, 3 paused, 1 resumed", out)
+
+    def test_run_syncs_before_sending_and_falls_back_to_local_file(self):
+        (Path(self.tmp.name) / "statements.txt").write_text("# comment\n\nfrom the file\n")
+        self._freeze(dt.datetime(2026, 9, 1, 8, 0, 5))
+        out = run_cli("run")
+        self.assertIn("synced from local file: 1 added", out)
+        self.assertEqual([t for _, t in self.sent], ["from the file"])
+
+    def test_sync_is_a_no_op_without_a_statements_file(self):
+        run_cli("add", "manual")
+        self.assertNotIn("synced", run_cli("sync"))
+        self.assertIn("manual", run_cli("list"))
+
+    def test_parse_statements_skips_comments_and_blanks(self):
+        self.assertEqual(manifest.parse_statements("# c\n\n a \nb\n"), ["a", "b"])
 
     # ---- random daily times
 

@@ -542,6 +542,79 @@ def set_schedule(con, times, at=None):
     set_setting(con, "schedule_since", ts(floor))
 
 
+# ---------------------------------------------------------------- statements file
+
+STATEMENTS_FILE = "statements.txt"
+
+
+def parse_statements(text):
+    lines = [line.strip() for line in text.splitlines()]
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def fetch_statements():
+    """The statements file as last pushed to GitHub for the checked-out
+    branch, fetched without touching the working tree; None when offline or
+    not a git checkout (the local copy is used then)."""
+    repo = str(SCRIPT.parent)
+    try:
+        branch = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        if not branch or branch == "HEAD":
+            return None
+        if subprocess.run(["git", "-C", repo, "fetch", "-q", "origin", branch],
+                          capture_output=True, text=True, timeout=30).returncode != 0:
+            return None
+        proc = subprocess.run(["git", "-C", repo, "show", "origin/%s:%s" % (branch, STATEMENTS_FILE)],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_statements(proc.stdout) if proc.returncode == 0 else None
+
+
+def sync_statements(con):
+    """Make the active messages match statements.txt: lines not yet present
+    are added, active messages no longer listed are paused (history kept).
+    Without the file nothing changes, so a plain `manifest add` setup keeps
+    working."""
+    wanted = fetch_statements()
+    source = "GitHub"
+    if wanted is None:
+        local = SCRIPT.parent / STATEMENTS_FILE
+        if not local.exists():
+            return
+        wanted = parse_statements(local.read_text())
+        source = "local file"
+    rows = con.execute("SELECT id, text, active FROM messages WHERE deleted_at IS NULL").fetchall()
+    have = {r["text"]: r for r in rows}
+    added = paused = resumed = 0
+    t = ts()
+    for text in wanted:
+        if text not in have:
+            con.execute("INSERT INTO messages (text, active, created_at, updated_at)"
+                        " VALUES (?, 1, ?, ?)", (text, t, t))
+            added += 1
+        elif not have[text]["active"]:
+            con.execute("UPDATE messages SET active = 1, updated_at = ? WHERE id = ?",
+                        (t, have[text]["id"]))
+            resumed += 1
+    for text, r in have.items():
+        if text not in wanted and r["active"]:
+            con.execute("UPDATE messages SET active = 0, updated_at = ? WHERE id = ?", (t, r["id"]))
+            paused += 1
+    con.commit()
+    if added or paused or resumed:
+        print("statements synced from %s: %d added, %d paused, %d resumed"
+              % (source, added, paused, resumed))
+
+
+def cmd_sync(args):
+    acquire_lock()
+    con = connect()
+    sync_statements(con)
+    cmd_list(args)
+
+
 def cmd_run(args):
     """launchd entry point: log the power state, catch up slots missed while
     the Mac slept, handle this firing's slot, then re-arm the wake schedule.
@@ -552,6 +625,7 @@ def cmd_run(args):
     at = now()
     print("[%s] run (power: %s)" % (ts(at), power_source()))
     try:
+        sync_statements(con)
         run_slots(con, at)
         # A run can span a sleep or a long retry ladder: a slot that fired
         # meanwhile is handled on a fresh clock (not after a failure — the
@@ -1131,6 +1205,7 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("add", help="add a message"); s.add_argument("text"); s.set_defaults(f=cmd_add)
+    s = sub.add_parser("sync", help="match the messages to statements.txt (also done before every send)"); s.set_defaults(f=cmd_sync)
     s = sub.add_parser("list", help="list messages"); s.set_defaults(f=cmd_list)
     s = sub.add_parser("edit", help="change a message's text")
     s.add_argument("id", type=int); s.add_argument("text"); s.set_defaults(f=cmd_edit)
