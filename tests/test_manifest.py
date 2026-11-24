@@ -929,8 +929,9 @@ class ManifestTest(unittest.TestCase):
 
     def test_random_times_respect_window_gap_and_count(self):
         import random as _random
-        for window, count, lo, hi, most in (("08:00-21:30", 18, 8 * 60, 21 * 60 + 30, 21),
-                                            ("00:00-24:00", 36, 0, 24 * 60 - 1, 36)):
+        for window, count, lo, hi, most in (("08:00-21:30", 18, 8 * 60, 21 * 60 + 30, 41),
+                                            ("00:00-24:00", 36, 0, 24 * 60 - 1, 72),
+                                            ("06:00-23:00", 50, 6 * 60, 23 * 60 - 1, 51)):
             self.assertEqual(manifest.max_random(window), most)
             for seed in range(20):
                 rng = _random.Random(seed)
@@ -954,13 +955,40 @@ class ManifestTest(unittest.TestCase):
         run_cli("shuffle")  # already today
         self.assertEqual(len(manifest.send_times(con)), 36)
         with self.assertRaises(SystemExit):
-            run_cli("random", "37", "--from", "00:00", "--to", "24:00")
+            run_cli("random", "73", "--from", "00:00", "--to", "24:00")
         with self.assertRaises(SystemExit):
             run_cli("random", "5", "--from", "09:00")
         with self.assertRaises(SystemExit):
             run_cli("random", "5", "--from", "22:00", "--to", "02:00")
         run_cli("random", "5")  # keeps the stored window
         self.assertEqual(manifest.get_setting(con, "window"), "00:00-24:00")
+
+    def test_fifty_a_day_sends_each_of_25_statements_twice(self):
+        for i in range(25):
+            run_cli("add", "statement %d" % i)
+        self._freeze(dt.datetime(2026, 9, 1, 0, 0, 0))
+        run_cli("random", "50", "--from", "06:00", "--to", "23:00")
+        con = manifest.connect()
+        times = manifest.send_times(con)
+        self.assertEqual(len(times), 50)
+        for t in times:  # launchd fires each slot on time
+            hh, mm = t.split(":")
+            self._freeze(dt.datetime(2026, 9, 1, int(hh), int(mm), 2))
+            run_cli("run")
+        texts = [t for _, t in self.sent]
+        self.assertEqual(len(texts), 50)
+        self.assertEqual(sorted(texts.count("statement %d" % i) for i in range(25)), [2] * 25)
+
+    def test_twenty_minute_gap_catches_up_a_missed_neighbour(self):
+        run_cli("add", "hello")
+        con = manifest.connect()
+        manifest.set_setting(con, "send_times", "10:00,10:20,10:40")
+        self._freeze(dt.datetime(2026, 9, 1, 10, 21, 0))  # woke just after 10:20; 10:00 missed
+        run_cli("run")
+        self.assertEqual(self._ok_slots(), ["10:00", "10:20"])
+        self._freeze(dt.datetime(2026, 9, 1, 10, 40, 1))
+        run_cli("run")
+        self.assertEqual(self._ok_slots(), ["10:00", "10:20", "10:40"])
 
     def test_random_command_sets_and_clears_shuffle(self):
         out = run_cli("random", "5")

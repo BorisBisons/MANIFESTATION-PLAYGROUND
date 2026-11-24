@@ -912,7 +912,9 @@ def cmd_status(args):
 # ---------------------------------------------------------------- random times
 
 DEFAULT_WINDOW = "08:00-21:30"
-MIN_GAP = 40                 # keeps every slot clear of its neighbours' 20-min windows
+# Minutes between random slots. Not below LATE_LIMIT: a slot that was missed is
+# then always old enough to be caught up by the time the next slot fires.
+MIN_GAP = 20
 
 
 def parse_window(text):

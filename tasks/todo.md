@@ -55,6 +55,9 @@ Facts checked: launchd replays sleep-missed StartCalendarInterval firings once o
 ## Follow-up: statements as a file synced from GitHub (user request, 2026-10-06)
 - [x] `statements.txt` (one per line, `#` comments) is the source of truth: `sync_statements` runs before every send — `git fetch` of the checked-out branch + `git show origin/<branch>:statements.txt`, never touching the code — and adds new lines / pauses removed ones / resumes re-added ones, keeping history; offline → local copy; no file → no-op. `manifest sync` on demand. The file carries the reworded statements the owner approved. Needs one `git pull` + `manifest install` on the mini to start (the mini runs the checked-out code; it does not self-update). 4 new tests, 76 pass.
 
+## Follow-up: every statement at least twice a day (user request, 2026-11-24)
+- [x] 25 statements × 2 = 50 sends/day, above the old cap of 36: `MIN_GAP` lowered from 40 to 20 min (= `LATE_LIMIT`, so a missed slot is always catch-up-eligible when its neighbour fires). Caps are now 51 in 06:00–23:00 and 72 in 24 h. Tests: 50 on-time firings over 25 statements send each exactly twice; a missed neighbour 20 min back is caught up. `statements.txt` holds the 25 statements (15 of the owner's reworded and amplified with their verses, 10 new from the "22 words"). Owner applies on the mini via the Dispatch prompt: pull, install, sync, `manifest random 50 --from 06:00 --to 23:00`.
+
 ## Review
 - Shipped as one file (`manifest.py`, ~430 lines) + tests + README. No dependencies, stdlib only.
 - 15 unit tests pass (rotation fairness, no-repeat, single-message repeat, none-active skip, on-time send, per-slot dedupe, 20-min late skip, midnight slot wraparound, failed-send logging, no-recipient safety, times validation, plist generation, stats, ntfy channel).
