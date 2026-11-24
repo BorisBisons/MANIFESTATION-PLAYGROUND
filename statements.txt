@@ -2,21 +2,21 @@
 # the agent fetches it from GitHub before every send and keeps the message
 # list in sync (new lines are added, removed lines are paused). Lines
 # starting with # are comments.
-I am worthy of $100 million, and it is flowing to me
-I have a beautiful wife and beautiful kids who love me, and I love them. We have a beautiful home and we all feel lucky to have each other.
-I am grateful for the beautiful family that I have
-I own a big successful business. I have a beautiful team that works hard. I enjoy waking up to go to my business.
-I vacation and enjoy all the beautiful things life has to offer. I love life and life is lovely.
-I am lucky, favoured and Godly in all my relations
-I have abundant peace
-I have abundant love
-I live a lovely sober life. I keep achieving enormous achievements.
-I am a millionaire
-My net worth grows every single day
-I am kind and faithful. I am loyal and loving.
-I have a mighty powerful God
-I am who I am. I am able. I can do all things through Christ who strengthens me.
-I am worth $100,000,000
+I am worthy of $100 million, and it is flowing to me. It is God who gives me the power to get wealth.
+I have a beautiful wife and beautiful kids who love me, and I love them. We have a beautiful home and we all feel lucky to have each other. As for me and my house, we serve the Lord.
+I am grateful for the beautiful family that I have. In everything I give thanks.
+I own a big successful business. I have a beautiful team that works hard. I enjoy waking up to go to my business. God gives me the power to build wealth through it.
+I vacation and enjoy all the beautiful things life has to offer. I love life and life is lovely. The joy of the Lord is my strength.
+I am lucky, favoured and Godly in all my relations. God's favour surrounds me like a shield, and all things work together for my good.
+I have abundant peace. The peace of God, which passes all understanding, keeps my heart and my mind.
+I have abundant love, and the greatest of all things is love.
+I live a lovely sober life. I keep achieving enormous achievements. The Son has made me free, and I am free indeed.
+I am a millionaire. I remember the Lord my God, for He gives me the power to get wealth.
+My net worth grows every single day. I have life, and I have it more abundantly.
+I am kind and faithful. I am loyal and loving. Faith, hope and love abide in me.
+I have a mighty powerful God. My faith is the substance of things hoped for, the evidence of things not seen.
+I am who I am. I am able. I can do all things through Christ who strengthens me. I am strong and of good courage, for the Lord my God is with me wherever I go.
+I am worth $100,000,000. God's covenant of wealth is established in my life.
 # Added from "My Manifestation: 22 Words and Their Verses"
 I am healthy and strong. I prosper and I am in health, even as my soul prospers.
 I am wise. God gives me wisdom generously in every decision I make.
